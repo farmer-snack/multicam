@@ -1,0 +1,99 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// 签名凭据从 keystore.properties 读取（该文件已被 .gitignore 排除）。
+// 缺失时不做签名配置，回落到系统默认 debug 签名，保证 clone 后仍可编译。
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
+android {
+    namespace 'com.example.multicam'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.multicam"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+        // 瘦身：只保留 arm64-v8a。armeabi-v7a 会额外带一份 OpenCV/TFLite 原生库，
+        // 体积翻倍；2016 年后的主流机型均为 arm64。如需兼容老 32 位机，
+        // 把 'armeabi-v7a' 加回来即可（功能代码无需改动）。
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    signingConfigs {
+        release {
+            if (keystoreProps.containsKey('storeFile')) {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+                // 同时启用 v1/v2/v3 签名，兼容 Android 7 ~ 14
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // debug 显式绑定 release 签名，避免 ABI 剥离等二次打包后签名失效；
+            // 未配置 keystore.properties 时保留 AGP 默认 debug 签名。
+            signingConfig keystoreProps.containsKey('storeFile')
+                    ? signingConfigs.release
+                    : signingConfigs.getByName('debug')
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystoreProps.containsKey('storeFile')) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions { jvmTarget = '17' }
+
+    buildFeatures { viewBinding false }
+
+    // ---------- 瘦身配置 ----------
+    androidResources {
+        // 红线：tflite 必须以「不压缩」方式存入 APK。
+        // TFLite 通过 AssetFileDescriptor + FileChannel.map() 做零拷贝加载，
+        // 一旦被压缩就抛 "Not a file descriptor for asset" 之类异常，模型全部加载失败。
+        noCompress 'tflite'
+    }
+    packagingOptions {
+        jniLibs {
+            // false = .so 以不压缩方式存放，由 zipalign -p 做页对齐，
+            // 安装时可 mmap 直接映射，省掉解压耗时并减少运行时内存占用。
+            useLegacyPackaging = false
+        }
+        // 顺手剔除不会被用到的 native 调试符号
+        exclude 'META-INF/*.kotlin_module'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.activity:activity-ktx:1.8.2'
+    implementation 'androidx.exifinterface:exifinterface:1.3.7'
+    implementation 'com.quickbirdstudios:opencv:4.5.3.0'
+    implementation 'org.tensorflow:tensorflow-lite:2.14.0'
+    // 瘦身：移除 tensorflow-lite-gpu。代码里只用到 NnApiDelegate（CPU/NNAPI 加速），
+    // 从没引用 GpuDelegate，去掉可省 ~6MB so 且不影响任何功能。
+    implementation 'com.google.mlkit:face-detection:16.1.6'
+}

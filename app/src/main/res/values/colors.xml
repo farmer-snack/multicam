@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg_deep">#0B0B0F</color>
+    <color name="bg_panel">#D90A0A0E</color>
+    <color name="bg_panel_light">#26FFFFFF</color>
+    <color name="stroke_soft">#33FFFFFF</color>
+    <color name="accent">#FF9F0A</color>
+    <color name="accent_dim">#66FF9F0A</color>
+    <color name="accent_soft">#1AFF9F0A</color>
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#B3FFFFFF</color>
+    <color name="text_hint">#80FFFFFF</color>
+    <color name="shutter_outer">#FFFFFFFF</color>
+    <color name="shutter_inner">#0B0B0F</color>
+    <color name="shutter_video">#FF3B30</color>
+    <color name="mode_normal">#B3FFFFFF</color>
+    <color name="panel_scrim">#E6000000</color>
+</resources>
