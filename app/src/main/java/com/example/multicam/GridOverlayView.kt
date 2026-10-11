@@ -11,7 +11,10 @@ class GridOverlayView(context: Context, attrs: AttributeSet? = null) : View(cont
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = android.graphics.Color.parseColor("#59FFFFFF")
-        strokeWidth = 1.5f
+        // 【修复】strokeWidth 单位是 px。原来固定 1.5px，在 3x 屏上经 GPU 缩放后
+        // 只剩半个物理像素 + 抗锯齿灰边，九宫格淡到几乎看不见。
+        // 改为按密度换算（约 1.5dp），各密度屏粗细一致。
+        strokeWidth = 1.5f * resources.displayMetrics.density
         style = Paint.Style.STROKE
     }
 

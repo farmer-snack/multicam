@@ -17,6 +17,7 @@ import androidx.annotation.RequiresApi
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 /**
  * 多摄并发会话（含修改 12–24 部分）：
@@ -206,8 +207,16 @@ class MultiConcurrentSession(
             val advice = SceneAdvisor.analyze(gray, currentZoomProvider())
             if (advice != null) {
                 compositionOverlay?.invoke(toSuggestion(advice))
+                // 【关键修复】与单摄同一问题：每 400ms 无条件下发会导致
+                // 极限环振荡，且用户手动调焦会被自动拽回。
                 if (autoZoomEnabled && advice.targetZoom > 0f) {
-                    onZoomRequest?.invoke(advice.targetZoom)
+                    val cur = currentZoomProvider()
+                    if (abs(advice.targetZoom - cur) > 0.15f &&
+                        abs(advice.targetZoom - lastAutoZoom) > 0.01f
+                    ) {
+                        lastAutoZoom = advice.targetZoom
+                        onZoomRequest?.invoke(advice.targetZoom)
+                    }
                 }
                 val curYaw = getYaw?.invoke() ?: 0f
                 val remain = advice.targetYawDelta - curYaw
@@ -231,6 +240,9 @@ class MultiConcurrentSession(
 
     /** 到位提示锁存：避免每 400ms 重复触发 */
     @Volatile private var targetReachedLatched = false
+
+    /** 上次自动变焦下发的目标倍率，用于去重、避免极限环振荡 */
+    @Volatile private var lastAutoZoom = 0f
 
     private fun yuvToGray(image: Image): Mat {
         val plane = image.planes[0]
@@ -298,35 +310,57 @@ class MultiConcurrentSession(
         )
     }
 
-    // ---------- 修改 23：变焦（作用于第一颗镜头） ----------
+    // ---------- 变焦（作用于主摄 primaryId） ----------
 
     fun setZoom(zoom: Float) {
         val id = primaryId
-        val device = devices[id] ?: return
-        val session = sessions[id] ?: return
-        val z = zoom.coerceIn(1f, maxZoom)
+        val device = synchronized(mapLock) { devices[id] } ?: return
+        val session = synchronized(mapLock) { sessions[id] } ?: return
+        // 【修复】coerceIn 要求 min<=max，极端 HAL 上报 maxDigitalZoom<1 会抛
+        // IllegalArgumentException，而原来这行在 try 之外。
+        val hi = if (maxZoom >= 1f) maxZoom else 1f
+        val z = zoom.coerceIn(1f, hi)
         try {
             val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 previewSurface?.let { addTarget(it) }
                 analysisReader?.let { addTarget(it.surface) }
-                set(CaptureRequest.SCALER_CROP_REGION, computeCropRegion(z))
+                computeCropRegion(z)?.let { set(CaptureRequest.SCALER_CROP_REGION, it) }
+                // 【关键修复】原来漏了 applyControlsTo(this)。
+                // setRepeatingRequest 是**整体替换**不是增量 patch：这个请求只带
+                // surface + crop，于是 AE 模式/闪光灯/EV/AWB/手动 ISO·快门全部回到
+                // 默认值。表现为"设好白平衡和闪光灯，一碰变焦就全被清掉"。
+                // 与同文件 applyControls() 里的写法对齐。
+                applyControlsTo(this)
             }
             session.setRepeatingRequest(req.build(), null, handler)
             currentZoom = z
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             AppLogger.w("MultiConcurrent", "变焦失败: ${e.message}")
         }
     }
 
-    private fun computeCropRegion(zoom: Float): Rect {
-        val chars = characteristics ?: return Rect(0, 0, 1, 1)
+    /**
+     * 预览/控制路（primaryId）的 crop region。
+     *
+     * 【关键修复】原来读共享字段 `characteristics`，它只在第一个 onOpened 时
+     * 为**第一颗相机**（超广角）填一次。而预览 Surface 绑在 primaryId（主摄）上，
+     * 于是 zoom>1 时拿超广角的 active array 去裁主摄 → 越界 →
+     * IllegalArgumentException 被 catch 吞掉 → **多摄模式点变焦预览纹丝不动**。
+     */
+    private fun computeCropRegion(zoom: Float): Rect? {
+        val chars = charsOf(primaryId) ?: return null
         val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            ?: return Rect(0, 0, 1, 1)
-        val w = (active.width() / zoom).toInt()
-        val h = (active.height() / zoom).toInt()
+            ?: return null
+        val z = if (zoom.isFinite() && zoom >= 1f) zoom else 1f
+        val w = (active.width() / z).toInt().coerceIn(1, active.width())
+        val h = (active.height() / z).toInt().coerceIn(1, active.height())
         val cx = active.centerX()
         val cy = active.centerY()
-        return Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        val r = Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        if (r.left < active.left || r.top < active.top ||
+            r.right > active.right || r.bottom > active.bottom
+        ) return null
+        return r
     }
 
     fun setAutoZoom(enabled: Boolean) { autoZoomEnabled = enabled }
@@ -420,14 +454,24 @@ class MultiConcurrentSession(
                     }
                     override fun onDisconnected(camera: CameraDevice) {
                         runCatching { camera.close() }
-                        synchronized(mapLock) { devices.remove(id); sessions.remove(id) }
-                        if (stopped) return
+                        // 【关键修复】必须校验身份。上一代设备的断开回调迟到时，
+                        // 原来会无条件 devices.remove(id) —— 而新一代已经 open 好
+                        // 并占着同一个 id，那颗设备就被从 map 里摘掉且永不被 close
+                        // → 相机被 HAL 永久占用 → MAX_CAMERAS_IN_USE。
+                        val stale = synchronized(mapLock) {
+                            if (devices[id] === camera) { devices.remove(id); sessions.remove(id); false }
+                            else true
+                        }
+                        if (stale || stopped) return
                         scheduleRetry("摄像头 $id 断开")
                     }
                     override fun onError(camera: CameraDevice, error: Int) {
                         runCatching { camera.close() }
-                        synchronized(mapLock) { devices.remove(id); sessions.remove(id) }
-                        if (stopped) return
+                        val stale = synchronized(mapLock) {
+                            if (devices[id] === camera) { devices.remove(id); sessions.remove(id); false }
+                            else true
+                        }
+                        if (stale || stopped) return
                         failed = true
                         scheduleRetry("摄像头 $id 错误 code=$error")
                     }
@@ -516,8 +560,8 @@ class MultiConcurrentSession(
 
     fun applyControls(c: CameraControls) {
         controls = c
-        val dev = devices[primaryId] ?: return
-        val s = sessions[primaryId] ?: return
+        val dev = synchronized(mapLock) { devices[primaryId] } ?: return
+        val s = synchronized(mapLock) { sessions[primaryId] } ?: return
         val surface = previewSurface ?: return
         try {
             val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -526,11 +570,11 @@ class MultiConcurrentSession(
                 // 修复（2026-10）：原实现漏掉了 SCALER_CROP_REGION，
                 // 任何一次控制项变更（切闪光/调 EV/改 ISO）都会把数码变焦重置回 1×，
                 // 与 setZoom() 的结果互相打架。
-                set(CaptureRequest.SCALER_CROP_REGION, computeCropRegion(currentZoom))
+                computeCropRegion(currentZoom)?.let { set(CaptureRequest.SCALER_CROP_REGION, it) }
                 applyControlsTo(this)
             }
             s.setRepeatingRequest(req.build(), null, handler)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             AppLogger.w("MultiConcurrent", "应用控制失败: ${e.message}")
         }
     }
@@ -660,17 +704,20 @@ class MultiConcurrentSession(
      * 按指定相机的 active array 计算 crop region。
      * 越界/非法时返回 null，调用方就不设 SCALER_CROP_REGION（用该路全幅）。
      */
-    private fun computeCropRegionFor(id: String, zoom: Float): Rect? {
+private fun computeCropRegionFor(id: String, zoom: Float): Rect? {
         val chars = charsOf(id) ?: return null
         val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: return null
         val z = if (zoom.isFinite() && zoom >= 1f) zoom else 1f
-        val w = (active.width() / z).toInt().coerceAtLeast(1)
-        val h = (active.height() / z).toInt().coerceAtLeast(1)
-        if (w > active.width() || h > active.height()) return null
+        val w = (active.width() / z).toInt().coerceIn(1, active.width())
+        val h = (active.height() / z).toInt().coerceIn(1, active.height())
         val cx = active.centerX()
         val cy = active.centerY()
-        val r = Rect(cx - w / 2, cy - w / 2, cx + w / 2, cy + h / 2)
+        // 【关键修复】原来这里写成了 Rect(cx - w/2, cx - w/2, cx + w/2, cx + w/2)，
+        // top/bottom 误用了 w —— 横向 active array（如 4000×3000）会得到
+        // Rect(0,0,4000,4000)，下面的越界检查直接判 null → 裁剪恒失效；
+        // 若恰好不越界则是静默裁掉底部整片画面。
+        val r = Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
         // 必须完整落在 active array 内，否则框架直接拒绝整条请求
         if (r.left < active.left || r.top < active.top ||
             r.right > active.right || r.bottom > active.bottom

@@ -15,6 +15,22 @@ object MatUtils {
 
     private const val MAX_DIM = 4096
 
+    /**
+     * Bitmap 像素数上限（ARGB_8888 下 ×4 字节）。
+     * 40MP ≈ 160MB，超过绝大多数设备的可用堆，再高必然 OOM。
+     * 取 4000 万像素作为硬门槛，宁可明确报错也不要静默失败。
+     */
+    private const val MAX_BITMAP_PIXELS = 40_000_000L
+
+    /**
+     * JPEG 字节 → Bitmap。
+     *
+     * 【关键修复】OutOfMemoryError 必须**重抛**，不能吞。
+     * 本函数的调用方（HdrProcessor / LongExposureProcessor / TemporalDenoiser /
+     * ImageCompositor / PanoramaStitcher）全都用 `?: continue` 处理 null，
+     * 一旦把 OOM 静默降级成 null，夜景 6 帧掉 5 帧时会「成功」用 1 帧出片，
+     * 用户看到的却是"HDR 好像没生效"。OOM 应当上抛，由上层统一降级/报错。
+     */
     fun jpegToBitmap(bytes: ByteArray): Bitmap? {
         return try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -33,7 +49,15 @@ object MatUtils {
             val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
                 ?: return null
             applyExif(bmp, readOrientation(bytes))
-        } catch (e: Exception) { null }
+        } catch (e: OutOfMemoryError) {
+            // 解码 12MP JPEG 本身就可能 OOM，这属于"输入太大"而非"文件损坏"，
+            // 静默变 null 会让上层用残缺的帧集继续出片。
+            AppLogger.e("MatUtils", "解码 OOM（${bytes.size / 1024}KB），上抛由上层降级", e)
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w("MatUtils", "JPEG 解码失败: ${e.message}")
+            null
+        }
     }
 
     fun bitmapToBgr(bmp: Bitmap): Mat {
@@ -46,12 +70,23 @@ object MatUtils {
     }
 
     fun bgrToBitmap(mat: Mat): Bitmap {
+        // 【修复】原来没有尺寸守卫。ARGB_8888 Bitmap 每像素 4 字节，
+        // 一张 4728×3548 的图 = 67MB；与其它 Mat 同时存活时极易 OOM，
+        // 而异常被上层的 catch(Exception) 吞掉 → 用户转圈几十秒后拿到原图，
+        // 且没有任何报错。超过阈值时主动抛，让上层明确降级。
+        val px = mat.cols().toLong() * mat.rows()
+        require(px <= MAX_BITMAP_PIXELS) {
+            "位图过大 ${mat.cols()}x${mat.rows()}（${px / 10000} 万像素）"
+        }
         val rgba = Mat()
-        Imgproc.cvtColor(mat, rgba, Imgproc.COLOR_BGR2RGBA)
-        val bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(rgba, bmp)
-        rgba.release()
-        return bmp
+        try {
+            Imgproc.cvtColor(mat, rgba, Imgproc.COLOR_BGR2RGBA)
+            val bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(rgba, bmp)
+            return bmp
+        } finally {
+            rgba.release()
+        }
     }
 
     fun bitmapToJpeg(bmp: Bitmap, quality: Int = 95): ByteArray {

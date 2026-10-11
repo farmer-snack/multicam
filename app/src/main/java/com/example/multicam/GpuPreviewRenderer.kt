@@ -101,7 +101,28 @@ class GpuPreviewRenderer : GLSurfaceView.Renderer {
             }
         """.trimIndent()
 
+        // 【关键修复】EGL 上下文重建时释放上一轮的 GL 对象与 SurfaceTexture。
+        // GLSurfaceView 默认 preserveEGLContextOnPause=false，每次切后台
+        // 上下文都会销毁、回前台重跑 onSurfaceCreated；而 SurfaceTexture
+        // 持有的 native BufferQueue **不属于 EGL 上下文**，不会随上下文销毁
+        // 自动回收 —— 不 release() 就是每轮泄漏一份（10~30 次前后台切换后
+        // 预览变黑 / 被 lowmemory 杀掉）。
+        // 注意：上下文已丢失时调用 glDelete* 是无害的 no-op。
+        releaseGlResources()
+
         program = buildProgram(vs, fs)
+        if (program == 0) {
+            // 【关键修复】原来不检查链接状态：失败时 program=0 或未链接成功，
+            // glGetAttribLocation 全返回 -1 → glUseProgram(0) 与
+            // glEnableVertexAttribArray(-1) 全是 GL_INVALID_VALUE，
+            // glDrawArrays 什么也不画 → **纯黑预览且不崩溃不报错**，
+            // 用户侧表现为"相机坏了"。
+            shaderError = "预览着色器编译失败，预览不可用"
+            // 局部变量：shaderError 是 @Volatile 可变属性，不能直接传给非空形参
+            AppLogger.e("GpuPreview", "预览着色器编译失败，预览不可用")
+            return
+        }
+        shaderError = null
         aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
         aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
         uTexLoc = GLES20.glGetUniformLocation(program, "uTexture")
@@ -152,17 +173,29 @@ class GpuPreviewRenderer : GLSurfaceView.Renderer {
 
     override fun onDrawFrame(gl: GL10?) {
         surfaceTexture?.updateTexImage()
+        // 【修复】program / oesTexId 为 0 时（shader 编译失败）直接画醒目底色。
+        // 原来会继续 glUseProgram(0) + glEnableVertexAttribArray(-1)，
+        // 全是 GL_INVALID_VALUE 且不报错 → 屏幕纯黑，用户以为相机坏了。
+        if (program == 0 || oesTexId == 0 || surfaceTexture == null) {
+            GLES20.glClearColor(0.35f, 0.08f, 0.08f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            return
+        }
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId)
-        GLES20.glUniform1i(uTexLoc, 0)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexId)
-        GLES20.glUniform1i(uLutLoc, 1)
-        GLES20.glUniform1f(uIntensityLoc, lutIntensity)
+        // 【修复】uniform location 可能是 -1（驱动把未使用的 uniform 优化掉了），
+        // 此时必须跳过提交，否则 GL_INVALID_OPERATION
+        if (uTexLoc >= 0) GLES20.glUniform1i(uTexLoc, 0)
+        if (uLutLoc >= 0) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexId)
+            GLES20.glUniform1i(uLutLoc, 1)
+        }
+        if (uIntensityLoc >= 0) GLES20.glUniform1f(uIntensityLoc, lutIntensity)
 
         computeUvs(uvBuf)
 
@@ -179,10 +212,16 @@ class GpuPreviewRenderer : GLSurfaceView.Renderer {
 
     /** 上传新的 LUT 纹理 */
     fun updateLut(lut: ByteArray) {
+        if (lutTexId == 0 || lut.size < 512 * 512 * 4) return
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexId)
-        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
-            512, 512, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE,
-            ByteBuffer.wrap(lut))
+        // 【关键修复】纹理已在 onSurfaceCreated 用 glTexImage2D 定义过（512×512 RGBA），
+        // 尺寸与格式都没变，用 glTexSubImage2D 只更新像素即可。
+        // 原来每次都 glTexImage2D 重新定义整张纹理 —— 部分驱动会走
+        // "孤儿化 + 重新分配"路径，额外触发驱动内存操作。
+        GLES20.glTexSubImage2D(
+            GLES20.GL_TEXTURE_2D, 0, 0, 0, 512, 512,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, ByteBuffer.wrap(lut)
+        )
     }
 
     /**
@@ -234,25 +273,89 @@ class GpuPreviewRenderer : GLSurfaceView.Renderer {
         buf.position(0)
     }
 
+    /**
+     * 【关键修复】原来完全不检查编译/链接状态：
+     * compile 失败只打一行日志就返回那个无效的 shader id；
+     * buildProgram 也不查 GL_LINK_STATUS 就把 program 交出去。
+     * 于是 shader 编译失败（片元着色器首行的
+     * `#extension GL_OES_EGL_image_external : require` 在部分 GLES2 上下文不可用）
+     * 时 → attrib location 全为 -1 → glDrawArrays 什么都不画 →
+     * **纯黑预览、不崩溃、不降级、UI 无任何提示**，用户以为相机坏了。
+     * 现在逐级检查 + 删除无效对象 + 返回 0 让上层走错误路径。
+     */
     private fun buildProgram(vs: String, fs: String): Int {
         val v = compile(GLES20.GL_VERTEX_SHADER, vs)
+        if (v == 0) return 0
         val f = compile(GLES20.GL_FRAGMENT_SHADER, fs)
-        return GLES20.glCreateProgram().also {
-            GLES20.glAttachShader(it, v)
-            GLES20.glAttachShader(it, f)
-            GLES20.glLinkProgram(it)
+        if (f == 0) {
+            GLES20.glDeleteShader(v)
+            return 0
         }
+        val p = GLES20.glCreateProgram()
+        if (p == 0) {
+            GLES20.glDeleteShader(v); GLES20.glDeleteShader(f)
+            return 0
+        }
+        GLES20.glAttachShader(p, v)
+        GLES20.glAttachShader(p, f)
+        GLES20.glLinkProgram(p)
+        val status = IntArray(1)
+        GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, status, 0)
+        if (status[0] == 0) {
+            AppLogger.e("GpuPreview", "link failed: ${GLES20.glGetProgramInfoLog(p)}")
+            GLES20.glDeleteProgram(p)
+            GLES20.glDeleteShader(v); GLES20.glDeleteShader(f)
+            return 0
+        }
+        // program 已接管 shader，链接后可立即删除
+        GLES20.glDetachShader(p, v); GLES20.glDeleteShader(v)
+        GLES20.glDetachShader(p, f); GLES20.glDeleteShader(f)
+        return p
     }
 
     private fun compile(type: Int, src: String): Int {
-        return GLES20.glCreateShader(type).also { s ->
-            GLES20.glShaderSource(s, src)
-            GLES20.glCompileShader(s)
-            val status = IntArray(1)
-            GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, status, 0)
-            if (status[0] == 0) {
-                AppLogger.e("GpuPreview", GLES20.glGetShaderInfoLog(s))
-            }
+        val s = GLES20.glCreateShader(type)
+        if (s == 0) {
+            AppLogger.e("GpuPreview", "glCreateShader 返回 0（type=$type）")
+            return 0
         }
+        GLES20.glShaderSource(s, src)
+        GLES20.glCompileShader(s)
+        val status = IntArray(1)
+        GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, status, 0)
+        if (status[0] == 0) {
+            AppLogger.e("GpuPreview", "compile failed type=$type: ${GLES20.glGetShaderInfoLog(s)}")
+            // 【修复】原来失败后不删除，每次上下文重建都泄漏一个 shader
+            GLES20.glDeleteShader(s)
+            return 0
+        }
+        return s
     }
+
+    /**
+     * 释放 GL 资源与 SurfaceTexture。
+     * 供 onSurfaceCreated 开头与 Activity 的 onPause/onDestroy 调用。
+     */
+    fun releaseGlResources() {
+        // SurfaceTexture 的 native BufferQueue 不随 EGL 上下文销毁，必须显式释放
+        surfaceTexture?.let { st ->
+            runCatching { st.setOnFrameAvailableListener(null) }
+            runCatching { st.release() }
+        }
+        surfaceTexture = null
+        if (program != 0) { GLES20.glDeleteProgram(program); program = 0 }
+        if (oesTexId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(oesTexId), 0); oesTexId = 0
+        }
+        if (lutTexId != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(lutTexId), 0); lutTexId = 0
+        }
+        aPositionLoc = -1; aTexCoordLoc = -1
+        uTexLoc = -1; uLutLoc = -1; uIntensityLoc = -1
+        onSurfaceTextureReady = null
+    }
+
+    /** shader 编译失败时的错误描述（供 UI 提示），正常为 null */
+    @Volatile var shaderError: String? = null
+        private set
 }

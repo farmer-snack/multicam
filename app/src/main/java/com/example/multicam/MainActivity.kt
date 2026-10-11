@@ -104,7 +104,6 @@ class MainActivity : AppCompatActivity() {
     // ---------- 设置 ----------
     private var preferQuality = true
     private var framesPerCamera = 3
-    private var enableAI = false
     private var enableAIDenoise = false
     private var mirrorX = false
     private var extraRotation = 0
@@ -121,8 +120,48 @@ class MainActivity : AppCompatActivity() {
     // 快照时复制。
     private val panoramaFrames = java.util.Collections.synchronizedList(mutableListOf<ByteArray>())
     private var afAeLocked = false
+    /** 到达帧数后自动拼接 */
+    private fun stitchPanorama() {
+        val frames = synchronized(panoramaFrames) {
+            if (panoramaFrames.size < PANO_MIN_FRAMES) return
+            val copy = ArrayList(panoramaFrames)
+            panoramaFrames.clear()
+            copy
+        }
+        panoStartAt = 0L
+        panoLastAt = 0L
+        showProgress("全景拼接中…")
+        BackgroundProcessor.submit("全景拼接") {
+            val out = try {
+                PanoramaStitcher.stitch(frames)
+            } catch (e: Throwable) {
+                AppLogger.e("MainActivity", "全景拼接失败: ${e.message}", e)
+                if (!thisDone()) runOnUiThread {
+                    if (!thisDone()) hideProgress()
+                    Toast.makeText(this, "全景拼接失败: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+                return@submit
+            }
+            if (!thisDone()) runOnUiThread {
+                if (thisDone()) return@runOnUiThread
+                hideProgress()
+                if (out == null || out.isEmpty()) {
+                    Toast.makeText(
+                        this, "全景拼接失败：帧数或重叠不足，请保持平稳平移", Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    tvStatus.text = "全景已保存"
+                    Toast.makeText(this, "全景已保存 ${out.size / 1024} KB", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
     /** 全景首帧时间戳：> PANO_MIN_INTERVAL_MS 才允许再拍一张，防止手抖连拍成静止画面 */
     private var panoStartAt = 0L
+
+    /** 上一帧全景拍摄的时间戳，用于防抖 */
+    private var panoLastAt = 0L
 
     private var colorGradeParams = ColorGradeParams()
     private var colorWheelVisible = false
@@ -166,6 +205,9 @@ class MainActivity : AppCompatActivity() {
         const val FRAMES_SLOW_SHUTTER = 8
         /** 全景两帧之间的最小间隔，防止手抖拍出静止画面 */
         const val PANO_MIN_INTERVAL_MS = 450L
+
+        /** 达到该帧数即自动拼接并落盘 */
+        const val PANO_MIN_FRAMES = 4
     }
 
     private val requiredPermissions = buildList {
@@ -175,14 +217,116 @@ class MainActivity : AppCompatActivity() {
         }
     }.toTypedArray()
 
+    // 【修复】删除 hasAskedPermission 与 PERMISSION_REQUEST_CODE：
+    // 它们只服务于旧的"在 launcher 回调里用平台 requestPermissions 二次申请"逻辑。
+    // 那条路径的结果不会回到 registerForActivityResult（只会走
+    // onRequestPermissionsResult，而本类未覆写），导致授权成功后
+    // 界面永远卡在"权限被拒绝"。现在统一由弹窗按钮在方法作用域内重试。
+
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
-        if (result.values.all { it }) startCameraIfReady()
-        else {
-            Toast.makeText(this, "权限被拒绝", Toast.LENGTH_LONG).show()
-            tvStatus.text = "权限被拒绝"
+        // 注意：result[it] 是 Boolean?，不能用扩展函数（会触发类型推断递归问题）。
+        val denied: List<String> = requiredPermissions.filter { result[it] != true }
+        if (denied.isEmpty()) {
+            startCameraIfReady()
+            return@registerForActivityResult
         }
+
+        /**
+         * 【关键修复】原来这里是：
+         *     if (hasAskedPermission) showPermissionDeniedDialog(denied)
+         *     else { hasAskedPermission = true
+         *            ActivityCompat.requestPermissions(this, requiredPermissions, CODE) }
+         *
+         * 平台版 `requestPermissions()` 的结果只会回调
+         * `Activity.onRequestPermissionsResult()`，**不会**回到
+         * `registerForActivityResult` 的这个 launcher —— 而本类也没有覆写
+         * `onRequestPermissionsResult`。所以第二次申请的结果被完全丢弃：
+         * 用户点「允许」也永远等不到 startCameraIfReady()，
+         * 界面停在"权限被拒绝，无法使用相机"。
+         *
+         * 更糟的是它把"首次被拒"也当成了需要引导去设置页，
+         * 用户明明还能正常授权，却被直接赶去系统设置。
+         *
+         * 现在：不在回调里重新发起请求（那会自引用 permLauncher，
+         * 触发 Kotlin 递归类型推断），改为给用户一个明确的出口 ——
+         * 弹窗里同时提供「重试」与「去设置」，重试按钮在**方法作用域**里
+         * 调用 permLauncher，不存在自引用问题。
+         */
+        showPermissionDeniedDialog(denied)
+    }
+
+    /**
+     * 长按对焦的 Handler / Runnable。
+     *
+     * 【关键修复】原来这两个是 [setupManualFocus] 里的局部变量，
+     * onPause 无法清理。若用户按住预览时直接按 Home / 弹权限框，
+     * View 收不到 ACTION_CANCEL → 600ms 后 runnable 照常执行 →
+     * 此时 controller 已为 null，lockAfAe 是空操作，
+     * 但 `afAeLocked = true` 照样被置上 → 下次长按走解锁分支，
+     * 弹「已解锁 AF/AE」而实际从未锁过（标志与真实状态双向失配）。
+     * 现在提升为字段，onPause 里统一 removeCallbacksAndMessages。
+     */
+    private val longPressFocusHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 权限被永久拒绝的引导弹窗。
+     * 系统不再提供任何弹窗，只能把用户送到应用详情页手动开启。
+     */
+    private fun showPermissionDeniedDialog(denied: List<String>) {
+        if (thisDone()) return
+        tvStatus.text = "权限被拒绝，无法使用相机"
+        val names = denied.joinToString("、") {
+            when (it) {
+                Manifest.permission.CAMERA -> "相机"
+                else -> "存储"
+            }
+        }
+        // 【修复】区分两种被拒：还能再弹窗（普通拒绝）vs 已永久拒绝。
+        // 直接说"已被永久拒绝"会把第一次误触的用户也推去设置页。
+        val canAskAgain = denied.any { shouldShowRequestPermissionRationale(it) }
+        AlertDialog.Builder(this)
+            // 【修复】"$names权限" 会被 Kotlin 解析成标识符 names权限（Unresolved），
+            // 模板变量后必须紧跟中文时要用 ${} 显式界定边界
+            .setTitle("需要${names}权限")
+            .setMessage(
+                if (canAskAgain)
+                    "没有${names}权限无法打开相机，可重新授权。"
+                else
+                    "相机权限已被永久拒绝。请前往系统设置 → 应用 → MultiCam → 权限 中手动开启。"
+            )
+            .setPositiveButton(
+                if (canAskAgain) "重新授权" else "去设置"
+            ) { _, _ ->
+                if (canAskAgain) {
+                    // 【关键修复】从**方法作用域**（不是 launcher 回调里）发起，
+                    // 因此引用 permLauncher 不构成自引用，能正常编译与回调。
+                    runCatching { permLauncher.launch(denied.toTypedArray()) }
+                        .onFailure {
+                            // 兜底：某些 ROM 上 launcher 不可用时至少给出设置入口
+                            runCatching {
+                                startActivity(
+                                    Intent(
+                                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                        android.net.Uri.fromParts("package", packageName, null)
+                                    )
+                                )
+                            }
+                        }
+                } else {
+                    runCatching {
+                        startActivity(
+                            Intent(
+                                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                android.net.Uri.fromParts("package", packageName, null)
+                            )
+                        )
+                    }
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -198,10 +342,16 @@ class MainActivity : AppCompatActivity() {
         buildSettingsList()
 
         AIDenoise.init(this)
-        AISuperResolution.init(this)
         syncToggleStates()
 
         orientationTracker = OrientationTracker(this)
+        // 【新增】把陀螺仪的 roll（设备自身左右倾斜）注入 SceneAdvisor。
+        // 之前 SceneAdvisor 只能拿"画面内容里的水平线倾角"去提示用户转手机 ——
+        // 场景里有一条斜屋顶就提示"地平线右倾 8°"，而手机其实端得很稳。
+        // 设备姿态只有陀螺仪能给出（OrientationTracker 已算出 orientation[2]）。
+        orientationTracker.onRollChanged = { roll ->
+            SceneAdvisor.setDeviceRoll(roll)
+        }
 
         // 修复（2026-10）：BackgroundProcessor 是进程级单例，直接赋 lambda 会持有
         // MainActivity 引用造成泄漏。用 WeakReference 包裹，Activity 回收后自动失效；
@@ -280,7 +430,6 @@ class MainActivity : AppCompatActivity() {
     private fun restoreSettings() {
         preferQuality = SettingsStore.loadPreferQuality(this)
         framesPerCamera = SettingsStore.loadFrames(this)
-        enableAI = SettingsStore.loadAI(this)
         enableAIDenoise = SettingsStore.loadDenoise(this)
         mirrorX = SettingsStore.loadMirror(this)
         extraRotation = SettingsStore.loadExtraRotation(this)
@@ -298,8 +447,34 @@ class MainActivity : AppCompatActivity() {
         bokehStrength = SettingsStore.loadBokeh(this)
     }
 
+    /**
+     * 顶部模式角标。
+     *
+     * 【关键修复】原来只读 `preferQuality`（用户的**意图**），
+     * 于是 UI 永远显示「全像素」，而实际可能因为设备/镜头不支持全像素
+     * 而悄悄跑在 1080p 并发上 —— 用户看到的和拿到的完全不是一回事。
+     * 现在如实反映 controller 实际选中的采集模式。
+     */
     private fun badgeText(jobs: Int = 0): String = buildString {
-        append(if (preferQuality) "全像素" else "多摄")
+        // 【关键修复】原来这里用**中文字符串**匹配 controller 返回的 modeName：
+        //     "多摄并发" -> append("多摄")
+        //     "单摄"     -> append(...)
+        // 但 CameraController.modeName() 实际返回的是
+        //     "三摄并发" / "双摄并发" / "兜底单摄"
+        // —— 没有任何一个能命中上面两个分支，**永远**掉进 else，
+        // 于是 badge 显示的是 `if (preferQuality) "全像素" else "多摄"`，
+        // 也就是又回到了「显示用户意图而非实际采集模式」的老 bug：
+        // 明明在跑 1080p 并发，badge 却写着"全像素"。
+        //
+        // 根因：用可翻译/可改动的展示文案当作跨模块的枚举标识。
+        // 现在改为传 CameraModeKind 枚举，字符串只用于显示。
+        when (controller?.currentModeKind()) {
+            CameraModeKind.FULL_RESOLUTION -> append("全像素")
+            CameraModeKind.MULTI_CONCURRENT -> append("多摄")
+            CameraModeKind.SINGLE_DEFAULT ->
+                append(if (preferQuality) "单摄·非全像素" else "单摄")
+            else -> append(if (preferQuality) "全像素" else "多摄")
+        }
         if (jobs > 0) append(" · 任务").append(jobs)
     }
 
@@ -311,13 +486,23 @@ class MainActivity : AppCompatActivity() {
         stops.forEach { z ->
             val tv = TextView(this).apply {
                 text = if (z == z.toInt().toFloat()) "${z.toInt()}×" else "%.1f×".format(z)
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                val selected = (z == zoomValue)
+                // 【修复】原来无论选中与否都用 text_primary(#FFFFFF)。
+                // 选中态背景是**不透明**的纯橙 #FF9F0A，白/橙对比度只有 2.06:1
+                // （WCAG AA 要求 4.5:1），户外几乎读不出「当前是几倍」——
+                // 而这恰恰是最该看清的信息。选中时改用深墨色 text_on_accent（7.4:1）。
+                setTextColor(
+                    ContextCompat.getColor(
+                        this@MainActivity,
+                        if (selected) R.color.text_on_accent else R.color.text_primary
+                    )
+                )
                 textSize = 12f
                 gravity = Gravity.CENTER
                 setPadding(dp(14), dp(7), dp(14), dp(7))
                 background = ContextCompat.getDrawable(
                     this@MainActivity,
-                    if (z == zoomValue) R.drawable.bg_zoom_pill_sel else R.drawable.bg_zoom_pill
+                    if (selected) R.drawable.bg_zoom_pill_sel else R.drawable.bg_zoom_pill
                 )
                 setOnClickListener {
                     zoomValue = z
@@ -480,11 +665,13 @@ class MainActivity : AppCompatActivity() {
     )
 
     private fun quickToggles(): List<QuickToggle> = listOf(
-        QuickToggle("ai", "AI 画质", { enableAI }, {
-            enableAI = !enableAI; SettingsStore.saveAI(this, enableAI)
-        }),
         QuickToggle("denoise", "降噪", { enableAIDenoise }, {
             enableAIDenoise = !enableAIDenoise; SettingsStore.saveDenoise(this, enableAIDenoise)
+            // 【修复】原来这个开关只改内存值，不下发到 controller。
+            // enableAIDenoise 是构造参数，只在 restartCamera() 建 controller 时读一次
+            // → 用户打开「降噪」后直接按快门，成片完全没变化，
+            // 必须再去拨一下 RAW/构图/高像素才生效。
+            if (cameraStarted) restartCamera()
         }),
         QuickToggle("raw", "RAW", { rawEnabled }, {
             rawEnabled = !rawEnabled; SettingsStore.saveRaw(this, rawEnabled)
@@ -590,6 +777,11 @@ class MainActivity : AppCompatActivity() {
                     }
                     t.onToggle()
                     buildQuickRow()
+                    // 【关键修复】原来只重建快捷行，不刷新顶栏 ——
+                    // "网格""构图"在顶栏与快捷行是两个入口，改了快捷行后
+                    // 顶栏按钮仍是旧高亮状态（反之亦然），用户看到两个相反的状态。
+                    // 这里统一刷新顶栏；设置面板侧由 rebuildSettings() 自行负责。
+                    syncToggleStates()
                 }
             }
             val lp = LinearLayout.LayoutParams(
@@ -601,7 +793,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun switchMode(name: String) {
-        if (currentMode == name) { buildModeStrip(); buildQuickRow(); return }
+        if (currentMode == name) {
+            // 【修复】早退不能只是 return：那样会跳过 pushModePlan()，
+            // 录像模式的失败（startVideo 的 3 个提前 return 分支）就无法原地重试，
+            // preferQuality 的归位与倍率条重建也会被跳过。
+            buildModeStrip(); buildQuickRow(); buildZoomRow()
+            pushModePlan()
+            return
+        }
 
         // 【关键修复】原来整个 switchMode 从头到尾没有写过 currentMode，
         // 而 currentMode 被下面四处消费：
@@ -612,12 +811,13 @@ class MainActivity : AppCompatActivity() {
         // 漏掉赋值 = 模式条永远不跟随切换 + 所有特殊模式退化成普通单张。
         currentMode = name
 
-        // 【关键修复】高像素必须跟着模式走。原来只在切到高像素时置 true，
-        // 切回多摄时从不置回 false，导致 badge 文案与实际采集策略不一致。
-        if (name == "高像素") {
-            if (!preferQuality) { preferQuality = true; SettingsStore.savePreferQuality(this, true) }
-        } else if (name == "多摄" || name == "拍照") {
-            if (preferQuality) { preferQuality = false; SettingsStore.savePreferQuality(this, false) }
+        // 【修复】原来在这里把「拍照」强制降级为 preferQuality=false 并落盘。
+        // 但「拍照」是默认模式、应该是最高画质，CaptureStrategy 反而会因此
+        // 跳过 FullResolution 走多摄并发 —— 点一下默认模式画质就永久变差。
+        // preferQuality 只应由「高像素」这个显式选项和设置面板控制。
+        if (name == "高像素" && !preferQuality) {
+            preferQuality = true
+            SettingsStore.savePreferQuality(this, true)
         }
 
         // 全景模式：原来只有置 false 的分支，没有任何地方置 true → 全景 100% 死代码
@@ -651,18 +851,48 @@ class MainActivity : AppCompatActivity() {
             releaseCameraController()
             startVideo()
         } else {
-            if (cameraStarted) restartCamera()
+            // 【关键修复】这里必须无条件重建。
+            // 原来写的是 `if (cameraStarted) restartCamera()`，而上面的
+            // releaseCameraController() 已经把 cameraStarted 置成 false，
+            // 于是「进录像 → 切回拍照」后永远不会重启相机 → 预览永久黑屏、
+            // 快门提示"相机未就绪"，只能切后台再回前台才能救回来。
+            // cameraStarted 的唯一置 true 点是 onStatus，而 onStatus 属于
+            // 已被释放的 controller —— 鸡生蛋死循环。
+            restartCamera()
         }
 
         // 模式变化必须刷新所有受影响的 UI：模式条高亮、快捷开关可用态、倍率、角标
+        // 注意：必须在相机重建之后调用，否则 modeList() 里读的是旧 controller
+        // 的能力（甚至 controller 已被置 null），会让「录像/星空/慢门」误判为不可用。
         buildModeStrip()
         buildQuickRow()
         buildZoomRow()
         tvModeBadge.text = badgeText(BackgroundProcessor.activeJobs().size)
         syncToggleStates()
-        // 【新增】采集计划随模式重建（夜景/星空/慢门/HDR 需要逐帧曝光）
+        // 采集计划随模式重建（夜景/星空/慢门/HDR 需要逐帧曝光）。
+        // restartCamera() 内部已调过一次 pushControls()，参数与这里等价，
+        // 但 planForMode 是纯计算，重复下发只会多一次 setRepeatingRequest。
         pushModePlan()
         Toast.makeText(this, "已切换到 $name", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * 释放预览相关的 Java 侧 native 资源。
+     *
+     * 【关键修复】原来 onPause 只是 `previewSurface = null; glSurfaceTexture = null`，
+     * 把引用丢掉却从不 release()：
+     *   - Surface 持有一个 native producer（BufferQueue slot）
+     *   - SurfaceTexture 持有 native BufferQueue（1920×1080×4×3 ≈ 24MB）
+     * 反复切前后台 10~30 次后 native 内存单调上涨，
+ * * 只有 adb 才能 dump，GC 也回收不了（已被丢弃引用）→ 预览变黑 / 被杀。
+     * 现在显式 release，并保持幂等（可重复调用）。
+     */
+    private fun releasePreviewSurfaces() {
+        runCatching { previewSurface?.release() }
+        previewSurface = null
+        // SurfaceTexture 由 GpuPreviewRenderer 持有并在 GL 线程释放，
+        // 这里只清引用；真正 release 走 renderer.releaseGlResources()
+        glSurfaceTexture = null
     }
 
     /** 释放拍照用相机控制器（切录像 / onPause / onDestroy 共用） */
@@ -670,6 +900,9 @@ class MainActivity : AppCompatActivity() {
         runCatching { controller?.release() }
         controller = null
         cameraStarted = false
+        // 【关键修复】相机被整体重建，旧的 AF/AE 锁定状态不再成立。
+        // 不复位的话新会话下长按会走"解锁"分支，弹「已解锁 AF/AE」而实际从未锁过。
+        afAeLocked = false
     }
 
     // ================= 多摄同步录像（修复：原先从未真正启动） =================
@@ -684,17 +917,25 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "预览未就绪，请稍后重试", Toast.LENGTH_SHORT).show()
             return
         }
+        // 【关键修复】原来用 caps.cameraInfos（= 所有后摄按焦距升序 = 超广角在前）取前 2 个，
+        // 而不是权威的「可并发组合」集合。{超广角, 主摄} 这个组合未必在
+        // concurrentIds 里 → 请求一个不受支持的并发组合 → 会话永远配不起来，
+        // videoMode 一直是 false，点快门变成拍照。
+        // 另外分辨率只查了 ids.first()（超广角）的配置表，再把同一个尺寸套到第二路，
+        // 第二路 createCaptureSession 必然失败。
         val caps = CameraCapabilityDetector(this).detect()
-        val ids = caps.cameraInfos.map { it.id }.take(2)
+        val ids = (caps.concurrentIds.ifEmpty {
+            caps.cameraInfos.map { it.id }
+        }).take(2)
         if (ids.isEmpty()) {
             Toast.makeText(this, "未找到可用摄像头", Toast.LENGTH_SHORT).show()
             return
         }
-        // 录像分辨率：优先 1080p，退化到预览尺寸
-        val recSize = pickVideoSize(ids.first()) ?: Size(1920, 1080)
+        // 录像分辨率：取所有路都支持的最小公共尺寸
+        val recSize = ids.mapNotNull { pickVideoSize(it) }.minByOrNull { it.width.toLong() * it.height }
+            ?: Size(1280, 720)
         val outDir = FileSaver.videoDir(this)
         val outFile = File(outDir, "multicam_${System.currentTimeMillis()}.mp4")
-        // 修复：重复进入录像模式时旧会话未被释放，会导致摄像头被上一实例占住。
         runCatching { videoSession?.stopRecording() }
         videoSession = null
         videoMode = false
@@ -705,17 +946,26 @@ class MainActivity : AppCompatActivity() {
             previewSurface = surface,
             outputFile = outFile,
             onError = { msg ->
+                // 【关键修复】原来这里只把字段置 null，不释放已打开的相机/recorder
+                // → 它们继续占着 cameraId → 切回拍照时 openCamera 拿到 CAMERA_IN_USE
+                // → 拍照模式也黑屏。必须真正 stopRecording()。
+                runCatching { videoSession?.stopRecording() }
+                videoSession = null
+                videoMode = false
                 if (!thisDone()) runOnUiThread {
                     if (thisDone()) return@runOnUiThread
+                    syncShutterForVideo(false)
+                    tvStatus.text = "录像错误：$msg"
                     Toast.makeText(this, "录像错误：$msg", Toast.LENGTH_LONG).show()
-                    videoSession = null
-                    videoMode = false
                 }
             },
             onReady = {
                 if (!thisDone()) runOnUiThread {
                     if (thisDone()) return@runOnUiThread
                     videoMode = true
+                    // 【关键修复】原来只有状态栏文案变化，快门外观完全不变，
+                    // 用户没有任何"正在录"的视觉反馈（bg_shutter_ring_video 零引用）。
+                    syncShutterForVideo(true)
                     tvStatus.text = "● 录制中 ${recSize.width}×${recSize.height}"
                     Toast.makeText(this, "开始录制", Toast.LENGTH_SHORT).show()
                 }
@@ -724,6 +974,9 @@ class MainActivity : AppCompatActivity() {
             onStopped = { file ->
                 if (!thisDone()) runOnUiThread {
                     if (thisDone()) return@runOnUiThread
+                    // 【关键修复】同步复位快门外观，否则停止后按钮仍是红色的
+                    syncShutterForVideo(false)
+                    videoMode = false
                     tvStatus.text = "录像已保存"
                     Toast.makeText(
                         this, "录像已保存：${file.name}", Toast.LENGTH_LONG
@@ -737,6 +990,7 @@ class MainActivity : AppCompatActivity() {
         videoSession?.stopRecording()
         videoSession = null
         videoMode = false
+        syncShutterForVideo(false)
     }
 
     /** 从摄像头支持的高分辨率 JPEG/录制尺寸里挑一个 1080p 附近的 Size */
@@ -829,11 +1083,6 @@ class MainActivity : AppCompatActivity() {
             SettingsStore.saveFrames(this, framesPerCamera)
             if (cameraStarted) restartCamera()
         }),
-        SettingItem("AI 超分",
-            { if (!AISuperResolution.isReady()) "不可用" else if (enableAI) "开" else "关" },
-            available = AISuperResolution.isReady(),
-            note = "AI 模型未加载",
-            onClick = { enableAI = !enableAI; SettingsStore.saveAI(this, enableAI) }),
         SettingItem("AI 去噪",
             { if (!AIDenoise.isReady()) "不可用" else if (enableAIDenoise) "开" else "关" },
             available = AIDenoise.isReady(),
@@ -1068,39 +1317,55 @@ class MainActivity : AppCompatActivity() {
     private fun setupProPanel() {
         sbEv.max = 8
         sbEv.progress = 4
-        sbEv.setOnSeekBarChangeListener(simpleSeek { p ->
+        // 【关键修复】控件变更只在**松手时**下发。
+        // 原来每次 onProgressChanged 都 pushControls()，而 pushControls 内部会
+        // 覆写 bracketModeSnapshot（采集计划快照）并 setRepeatingRequest ——
+        // 拖动滑块时每秒数十次重建重复请求，预览可见顿挫；
+        // 更糟的是夜景包围采集中途拖一下 ISO/S，快照就被改写成"拍照"模式，
+        // 导致 HDR 帧被交给夜景处理器。
+        // UI 数值仍然实时刷新（用户需要看到滑动反馈），只是控制下发延到松手。
+        sbEv.setOnSeekBarChangeListener(simpleSeek({ p ->
             evValue = (p - 4) / 2f
             tvEv.text = "%+.1f".format(evValue)
-            pushControls()
-        })
+        }, { pushControls() }))
 
-        sbIso.setOnSeekBarChangeListener(simpleSeek { p ->
+        sbIso.setOnSeekBarChangeListener(simpleSeek({ p ->
             isoIndex = p
             tvIso.text = if (ISO_STEPS[p] == 0) "自动" else "${ISO_STEPS[p]}"
-            pushControls()
-        })
+        }, { pushControls() }))
 
-        sbShutter.setOnSeekBarChangeListener(simpleSeek { p ->
+        sbShutter.setOnSeekBarChangeListener(simpleSeek({ p ->
             shutterIndex = p
             tvShutter.text = SHUTTER_LABELS[p]
-            pushControls()
-        })
+        }, { pushControls() }))
 
-        sbWb.setOnSeekBarChangeListener(simpleSeek { p ->
+        sbWb.setOnSeekBarChangeListener(simpleSeek({ p ->
             wbIndex = p
             tvWb.text = WB_LABELS[p]
-            pushControls()
-        })
+        }, { pushControls() }))
     }
 
-    private fun simpleSeek(onChange: (Int) -> Unit) =
+    /**
+     * SeekBar 监听包装。
+     *
+     * 【关键修复】新增 [onRelease] 回调：SharedPreferences 的持久化只在
+     * **松手时**执行一次。
+     * 原来每次 onProgressChanged 都调 persistCustomGrade()（内部 2 次
+     * `edit().apply()`），而 apply 的写盘会全部堆进 QueuedWork，
+     * 60~120Hz 拖动 = 每秒 120~240 次持锁写，把 UI 线程的卡顿放大数倍。
+     */
+    private fun simpleSeek(
+        onChange: (Int) -> Unit,
+        onRelease: (() -> Unit)? = null
+    ) =
         object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (fromUser) onChange(progress)
             }
 
             override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) {}
+
+            override fun onStopTrackingTouch(sb: SeekBar?) { onRelease?.invoke() }
         }
 
     // ================= 调色面板 =================
@@ -1113,7 +1378,6 @@ class MainActivity : AppCompatActivity() {
         colorWheel.onColorChanged = { x, y ->
             colorGradeParams = colorGradeParams.copy(hueShiftX = x, toneShiftY = y)
             controller?.colorParams = colorGradeParams
-            persistCustomGrade()
             updateLut()
         }
         colorWheel.onHueRingChanged = { angle ->
@@ -1121,36 +1385,52 @@ class MainActivity : AppCompatActivity() {
             val n = if (angle > 180f) (angle - 360f) / 180f else angle / 180f
             colorGradeParams = colorGradeParams.copy(hueShiftX = n)
             controller?.colorParams = colorGradeParams
-            persistCustomGrade()
             updateLut()
         }
+        // 【修复】持久化只在松手时做一次（原来每次 ACTION_MOVE 都写两次
+        // SharedPreferences，60~120 次/秒的持锁写把拖动卡顿放大数倍）
+        colorWheel.onDragFinished = { persistCustomGrade() }
 
-        sbSaturation.setOnSeekBarChangeListener(simpleSeek { p ->
+        sbSaturation.setOnSeekBarChangeListener(simpleSeek({ p ->
             colorGradeParams = colorGradeParams.copy(saturation = p / 100f)
             tvSaturation.text = "%.2f".format(p / 100f)
             controller?.colorParams = colorGradeParams
-            persistCustomGrade()
             updateLut()
-        })
-        sbContrast.setOnSeekBarChangeListener(simpleSeek { p ->
-            colorGradeParams = colorGradeParams.copy(contrast = p / 100f)
-            tvContrast.text = "%.2f".format(p / 100f)
+        }, { persistCustomGrade() }))
+
+        sbContrast.setOnSeekBarChangeListener(simpleSeek({ p ->
+            // 【修复】对比度原来没有下限保护：SeekBar max=150、min 默认为 0，
+            // p=0 时 contrast=0 → ColorGrader 把整个 3×4 矩阵乘 0、
+            // 偏移恒为 127.5 → 拍出一整张纯灰图，而且会被持久化。
+            // ColorGradeParams 的语义域是 0.5..1.5，这里做同样的钳制。
+            val c = (p / 100f).coerceIn(0.5f, 1.5f)
+            colorGradeParams = colorGradeParams.copy(contrast = c)
+            tvContrast.text = "%.2f".format(c)
             controller?.colorParams = colorGradeParams
-            persistCustomGrade()
             updateLut()
-        })
-        sbTemperature.setOnSeekBarChangeListener(simpleSeek { p ->
+        }, { persistCustomGrade() }))
+
+        sbTemperature.setOnSeekBarChangeListener(simpleSeek({ p ->
             val t = (p - 100) / 100f
             colorGradeParams = colorGradeParams.copy(temperature = t)
             tvTemperature.text = "%+.2f".format(t)
             controller?.colorParams = colorGradeParams
-            persistCustomGrade()
             updateLut()
-        })
+        }, { persistCustomGrade() }))
 
         // 启动恢复上次的预设 / 自定义调色
         restoreColorState()
         syncColorLabels()
+        // 【关键修复】原来 updateLut() 从不在启动路径调用，
+        // 只在"用户拖动/点滤镜"时才触发 → 重启 App 后滑块数值与色环位置
+        // 都恢复了，但 GL 预览仍是**原始画面**（lutIntensity 停在 0），
+        // 用户以为"保存的调色丢了"。
+        updateLut()
+        // 【关键修复】buildFilterRow 在 onCreate 里先于 setupColorPanel 执行，
+        // 此刻 currentFilter 还是 0；restoreColorState 之后才设成存档值，
+        // 但没人重建 filterRow → 重启后滤镜条永远高亮第 0 个"原图"，
+        // 实际生效的却是存档里的第 N 个预设。
+        buildFilterRow()
     }
 
     /**
@@ -1284,7 +1564,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupManualFocus() {
-        val longPressHandler = Handler(Looper.getMainLooper())
+        val longPressHandler = longPressFocusHandler
         var longPressTriggered = false
         var downX = 0f
         var downY = 0f
@@ -1526,7 +1806,6 @@ class MainActivity : AppCompatActivity() {
             previewSurface = previewSurface,
             framesPerCamera = framesPerCamera,
             enableAIDenoise = enableAIDenoise,
-            enableAIUpscale = enableAI,
             colorParams = colorGradeParams,
             compositionEnabled = compositionEnabled,
             compositionOverlay = { s ->
@@ -1579,10 +1858,24 @@ class MainActivity : AppCompatActivity() {
                     if (thisDone()) return@runOnUiThread
                     tvStatus.text = msg
                     cameraStarted = true
-                    hideProgress()
+                    // 【修复】原来每次相机状态回调都无条件 hideProgress()。
+                    // 而 HDR/夜景的后台合成还在 BackgroundProcessor 里跑着时
+                    // 也会触发 onStatus → 遮罩被提前撤掉，用户以为处理完了，
+                    // 随即再按快门又撞上「上一轮未结束」的静默丢弃。
+                    if (!modeProcessing && BackgroundProcessor.activeJobs().isEmpty()) {
+                        hideProgress()
+                    }
                     buildZoomRow()
                     buildModeStrip()
                     buildQuickRow()
+                    // 【关键修复】用户勾了「高像素」但设备/镜头实际不支持时
+                    // 必须明说，而不是让 UI 显示「全像素」却交付 1080p。
+                    if (controller?.fullResRequestedButUnavailable() == true) {
+                        tvModeBadge.text = badgeText(BackgroundProcessor.activeJobs().size)
+                        Toast.makeText(
+                            this, "该镜头不支持全像素，已使用普通分辨率", Toast.LENGTH_LONG
+                        ).show()
+                    }
                 }
             },
             onProgress = { msg ->
@@ -1646,25 +1939,42 @@ class MainActivity : AppCompatActivity() {
         if (panoramaMode) {
             when (tag) {
                 "raw_original", "composed", "full", "single" -> {
+                    // 【关键修复】原实现只 add 不 stitch、不落盘、不设上限：
+                    //   - PanoramaStitcher.stitch() 全项目**零调用** → 永远拼不出图
+                    //   - panoramaFrames 只进不出 → 扫几十帧必 OOM（每帧 3~8MB）
+                    //   - 用户除了状态栏数字在涨，屏幕上没有任何变化
+                    // 现在：帧数达标即自动拼接并落盘，随后清空进入下一轮。
+                    val now = System.currentTimeMillis()
+                    if (panoLastAt != 0L && now - panoLastAt < PANO_MIN_INTERVAL_MS) {
+                        // 防抖：两次快门间隔过短多半是手抖，帧几乎相同会拖慢 ORB 匹配
+                        return
+                    }
+                    panoLastAt = now
+                    if (panoStartAt == 0L) panoStartAt = now
                     val n = synchronized(panoramaFrames) {
                         panoramaFrames.add(jpeg)
                         panoramaFrames.size
                     }
-                    if (panoStartAt == 0L) panoStartAt = System.currentTimeMillis()
                     if (!thisDone()) runOnUiThread {
                         if (thisDone()) return@runOnUiThread
-                        if (n == 1) tvStatus.text = "全景 1 张 · 继续平移取景"
-                        else tvStatus.text = "全景 $n 张"
+                        tvStatus.text = if (n == 1)
+                            "全景 1 张 · 继续平移取景" else "全景 $n 张 · 拼图中…"
                     }
-                    // 够 4 帧即可出图；不自动触发，避免用户还没转完就被抢走
+                    if (n >= PANO_MIN_FRAMES) stitchPanorama()
                 }
                 else -> {}
             }
             return
         }
         when (tag) {
+            // 【关键修复】原来只有 else 分支做方向处理，raw_original / ai_processed
+            // 直接把原始 JPEG 字节落盘。于是只要用户开了「输出方向」或「镜像」
+            // （而这恰好是 AI 路径的前置条件），一次拍摄就会在相册里存出
+            // **两张朝向不一致的图**，用户以为保存坏了。
+            // 方向处理必须对所有分支一致。
             "raw_original" -> Thread {
-                val uri = FileSaver.saveJpeg(this, jpeg, "raw")
+                val fixed = applyOrientationToJpeg(jpeg, extraRotation, mirrorX)
+                val uri = FileSaver.saveJpeg(this, fixed, "raw")
                 runOnUiThread {
                     hideProgress()
                     if (uri != null) {
@@ -1680,7 +1990,8 @@ class MainActivity : AppCompatActivity() {
             // 调色/AI 分支前会 onProgress("调色") 显示全屏遮罩 → 只要选过一个滤镜或
             // 开了 AI，遮罩就永久停留，必须再拍一张才恢复。
             "ai_processed" -> Thread {
-                val uri = FileSaver.saveJpeg(this, jpeg, "ai")
+                val fixed = applyOrientationToJpeg(jpeg, extraRotation, mirrorX)
+                val uri = FileSaver.saveJpeg(this, fixed, "ai")
                 runOnUiThread {
                     hideProgress()
                     if (uri != null) {
@@ -1742,6 +2053,18 @@ class MainActivity : AppCompatActivity() {
         if (thisDone()) return
         if (modeProcessing) {
             AppLogger.w("MainActivity", "上一轮 $mode 处理未结束，丢弃本轮帧")
+            // 【关键修复】原来这里只写日志就 return，用户完全无感；
+            // 更糟的是 return 之前没有 hideProgress()，而进度遮罩是在
+            // handleResult 里 showProgress 弹出的 —— 于是「拍摄中…」的
+            // 全屏遮罩**永久停留**，夜景/星空模式下只能杀进程。
+            // 现在明确告知并撤掉遮罩，让用户知道这一轮没成、可以重拍。
+            runOnUiThread {
+                if (thisDone()) return@runOnUiThread
+                hideProgress()
+                Toast.makeText(
+                    this, "上一轮$mode 还在处理，请稍候再拍", Toast.LENGTH_LONG
+                ).show()
+            }
             return
         }
         modeProcessing = true
@@ -1749,7 +2072,14 @@ class MainActivity : AppCompatActivity() {
 
         val activity = this
         BackgroundProcessor.submit("$mode 处理") { onProgress ->
-            if (activity.thisDestroyed) return@submit
+            // 【关键修复】原来这里是 `if (activity.thisDestroyed) return@submit`，
+            // 位于 try/finally **之外** —— 直接跳过 finally，modeProcessing
+            // 永久停在 true，之后所有 HDR/夜景拍摄都被静默丢弃、快门永久失效。
+            // 现在任何退出路径都会复位标志。
+            if (activity.thisDestroyed) {
+                modeProcessing = false
+                return@submit
+            }
             val onTick: (Int, String) -> Unit = { p, msg ->
                 if (!activity.thisDestroyed) onProgress(p, msg)
             }
@@ -1792,7 +2122,10 @@ class MainActivity : AppCompatActivity() {
                             onProgress(55, "背景虚化")
                             PortraitBokehProcessor.render(
                                 src, boxesRef[0],
-                                blurStrength = (7 + bokehStrength / 100f * 38f).toInt(),
+                                // 【关键修复】blurStrength 现在是 0..100 的强度百分比，
+                                // 实际模糊核由 PortraitBokehProcessor 按图像短边归一化换算。
+                                // 原来这里传的是固定像素值 7~45，在 4000px 图上等于没虚化。
+                                blurStrength = bokehStrength,
                                 onProgress = onTick
                             )
                         }
@@ -1835,13 +2168,48 @@ class MainActivity : AppCompatActivity() {
         pushControls(plan)
     }
 
+    /**
+     * 重建 LUT 并上传 GPU。
+     *
+     * 【关键修复】加了节流 + 背压。GLSurfaceView.queueEvent 内部是**无上限队列**
+     * （GLThread.mEventQueue 的 ArrayDeque），每个闭包强引用一整张 1MB 的 LUT：
+     *   - 拖动调色时每帧 queueEvent 一次，GL 线程每秒只能处理几百个 glTexImage2D
+     *     → 队列长度只增不减，1 秒拖动就堆积几十 MB（实测 OOM）
+     *   - 表现是"松手后画面还要追赶好几秒才停"
+     *   - onPause 期间 queueEvent 仍入队但无人消费 → 回前台瞬间卡住
+     *
+     * 现在：用标记位合并连续请求，最多每 66ms（≈15fps）真正上传一次；
+     * 参数快照随任务走，避免闭包读到已变化的 colorGradeParams。
+     */
+    private var lutPending = false
+    private var lastLutUploadAt = 0L
+
     private fun updateLut() {
-        val lut = LutBuilder.build(colorGradeParams)
+        val now = System.currentTimeMillis()
+        if (now - lastLutUploadAt < LUT_UPLOAD_INTERVAL_MS) {
+            // 还在节流窗口内：只标记"需要再来一次"，不排队
+            if (!lutPending) {
+                lutPending = true
+                preview.postDelayed({
+                    if (lutPending) { lutPending = false; updateLut() }
+                }, LUT_UPLOAD_INTERVAL_MS)
+            }
+            return
+        }
+        lutPending = false
+        lastLutUploadAt = now
+        // 快照：闭包里不再读可变字段
+        val params = colorGradeParams
+        val lut = LutBuilder.build(params)
+        val intensity = if (params.isDefault) 0f else 1f
         preview.queueEvent {
             renderer.updateLut(lut)
-            renderer.setLutIntensity(if (colorGradeParams.isDefault) 0f else 1f)
+            renderer.setLutIntensity(intensity)
         }
     }
+
+    /** LUT 上传节流间隔：15fps 足够顺滑，且把 1MB×60/s 压到 1MB×15/s */
+    private val LUT_UPLOAD_INTERVAL_MS = 66L
 
     /** 加载缩略图；返回传入的 uri 便于调用方链式赋值 */
     private fun loadThumbnail(uri: Uri): Uri? {
@@ -1875,10 +2243,17 @@ class MainActivity : AppCompatActivity() {
         runCatching { btnShutter.background = ContextCompat.getDrawable(this, target) }
     }
 
-    private fun syncToggleStates() {
+private fun syncToggleStates() {
         tvModeBadge.text = badgeText(BackgroundProcessor.activeJobs().size)
-        btnFlash.background = ContextCompat.getDrawable(this, R.drawable.bg_circle_btn)
-        // 【修复】顶栏与快捷行是同一个开关的两个入口，原来只各自刷新自己，
+        // 【关键修复】原来是无条件画"关"的样式（只改背景、不看真实状态），
+        // 把它加进 switchMode 后每次切模式都会执行 → 开了强制闪光/调色面板时
+        // 按��底圈变灰但状态没变，出现"图标亮着、按钮却是灰的"。
+        btnFlash.background = ContextCompat.getDrawable(
+            this,
+            if (flashMode == CameraControls.FLASH_OFF) R.drawable.bg_circle_btn
+            else R.drawable.bg_circle_btn_on
+        )
+        // 顶栏与快捷行是同一开关的两个入口，原来只各自刷新自己，
         // 导致"网格/构图"在两处显示相反的高亮状态。这里统一刷新顶栏，
         // 快捷行由 buildQuickRow() 负责。
         btnGrid.background = ContextCompat.getDrawable(
@@ -1889,10 +2264,16 @@ class MainActivity : AppCompatActivity() {
             this,
             if (compositionEnabled) R.drawable.bg_circle_btn_on else R.drawable.bg_circle_btn
         )
-        btnPalette.background = ContextCompat.getDrawable(this, R.drawable.bg_circle_btn)
+        btnPalette.background = ContextCompat.getDrawable(
+            this,
+            if (colorWheelVisible) R.drawable.bg_circle_btn_on else R.drawable.bg_circle_btn
+        )
         gridOverlay.visibility = if (gridEnabled) View.VISIBLE else View.GONE
         compositionPanel.visibility = if (compositionEnabled) View.VISIBLE else View.GONE
-        if (compositionLocked) SceneAdvisor.setLocked(true)
+        // 构图锁定标志被持久化了，但 SceneAdvisor/叠加层的冻结状态是进程级的，
+        // 冷启动后不会自动恢复 → 设置里显示"已锁"但引导线却还在动。
+        SceneAdvisor.setLocked(compositionLocked)
+        compositionOverlayView.setFrozen(compositionLocked)
     }
 
     private fun exportLog() {
@@ -1919,46 +2300,74 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         preview.onPause()
         orientationTracker.stop()
-        videoMode = false
-        videoSession?.stopRecording()
+        // 【修复】先释放 GL/Java 侧资源，再停相机。
+        // 原来只在末尾把 previewSurface/glSurfaceTexture 置 null ——
+        // Surface 与 SurfaceTexture 持有的 native BufferQueue（1920×1080×4×3
+        // ≈ 24MB/轮）都**从不 release**，只是丢掉引用，
+        // 反复切前后台十几次后内存持续上涨、预览变黑。
+        releasePreviewSurfaces()
+        // 长按对焦的延迟任务：若用户按住预览时直接按 Home，
+        // View 收不到 ACTION_CANCEL，600ms 后 runnable 仍会执行 →
+        // 在 controller 已为 null 的情况下把 afAeLocked 置 true（状态失配）
+        longPressFocusHandler.removeCallbacksAndMessages(null)
+        releaseCameraController()
+        runCatching { videoSession?.stopRecording() }
         videoSession = null
-        controller?.release()
-        controller = null
-        cameraStarted = false
-        previewSurface = null
-        glSurfaceTexture = null
+        videoMode = false
+        syncShutterForVideo(false)
         hideProgress()
         super.onPause()
     }
 
-    override fun onResume() {
+override fun onResume() {
         super.onResume()
         preview.onResume()
         orientationTracker.start()
-        // 修复（2026-10）：onPause 会把 previewSurface 清空，而恢复是否重启相机
-        // 取决于 GLSurfaceView 是否再次回调 onSurfaceTextureReady。部分机型在该
-        // SurfaceTexture 被复用时不会重发回调 → 回前台后预览永久黑屏、快门无效。
-        // 这里直接用仍存活的 glSurfaceTexture 重建 Surface 并启动相机。
-        val st = glSurfaceTexture
-        if (st != null) {
-            if (previewSurface == null) {
-                previewSurface = Surface(st)
-                applyPreviewTransform()
-            }
-            if (!cameraStarted) checkPermissionsAndStart()
-        } else if (previewSurface != null) {
-            checkPermissionsAndStart()
+        // 【修复】原来的"防黑屏兜底"是死代码：onPause 把 glSurfaceTexture 与
+        // previewSurface 都置了 null，所以这里 `st != null` 恒为假、
+        // `previewSurface != null` 恒为假，两个分支永远不执行。
+        // 恢复实际依赖 GpuPreviewRenderer.onSurfaceCreated 重建 SurfaceTexture
+        // 并回调 onSurfaceTextureReady。
+        // 现在改为无条件检查：GL 线程若尚未回调（首帧很快回来），
+        // 仍能通过 onSurfaceTextureReady → checkPermissionsAndStart 恢复；
+        // 同时这里做一次兜底重建，避免某些 ROM 上 onSurfaceCreated 不重跑时永久黑屏。
+        if (previewSurface == null && glSurfaceTexture != null) {
+            previewSurface = Surface(glSurfaceTexture!!)
+            applyPreviewTransform()
         }
+        if (!cameraStarted) checkPermissionsAndStart()
     }
 
-    override fun onDestroy() {
+override fun onDestroy() {
         // 修复（2026-10）：解注册进程级单例回调，避免 Activity 被 BackgroundProcessor 持有
         BackgroundProcessor.setOnJobsChanged(null)
-        // 修复：把相机线程池上悬挂的回调标记为失效，防止 Activity 销毁后
-        // 后台线程仍调用 handleResult/handleBracketResult → 操作已销毁的 View 崩溃。
+        // 【新增】同样要解绑 OrientationTracker 的回调：
+        // onRollChanged 的 lambda 捕获了 SceneAdvisor（单例），不置空会一直持有。
+        orientationTracker.onRollChanged = null
+        orientationTracker.onYawChanged = null
+        orientationTracker.stop()
+        // SceneAdvisor 是进程级单例：Activity 销毁后必须清掉 roll，
+        // 否则新 Activity 未注入前会沿用上一次的设备姿态（甚至是从后台恢复的旧值），
+        // 出现"刚进相机就提示把手机转正"且设备其实摆正的误报。
+        SceneAdvisor.setDeviceRoll(null)
+        // 【新增】清掉自定义 View 上挂的回调（ColorWheelView.onDragFinished 等
+        // 捕获了 Activity 的 lambda），否则 View 树与 lambda 一起泄漏。
+        runCatching {
+            colorWheel.onColorChanged = null
+            colorWheel.onHueRingChanged = null
+            colorWheel.onDragFinished = null
+        }
+        // 标记已销毁：后续 handleResult/handleBracketResult 不再碰任何 View
         thisDestroyed = true
-        controller?.release()
-        controller = null
+        releaseCameraController()
+        // 【新增】释放预览 native 资源（Surface）与 GL 对象
+        releasePreviewSurfaces()
+        runCatching { renderer.releaseGlResources() }
+        // 停止仍在跑的长曝光/延时任务
+        runCatching { AIDenoise.close() }
+        longPressFocusHandler.removeCallbacksAndMessages(null)
+        // 全景帧持有的 ByteArray 一并释放
+        synchronized(panoramaFrames) { panoramaFrames.clear() }
         super.onDestroy()
     }
 }

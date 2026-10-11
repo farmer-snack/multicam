@@ -42,7 +42,7 @@ object NightProcessor {
             val bytes = MatUtils.bitmapToJpeg(bmp, 95)
             bmp.recycle()
             bytes
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             AppLogger.e(TAG, "夜景合成异常: ${e.message}", e)
             frames[0]
         } finally {

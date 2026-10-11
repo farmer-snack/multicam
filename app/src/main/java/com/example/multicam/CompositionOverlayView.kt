@@ -55,6 +55,55 @@ class CompositionOverlayView(context: Context, attrs: AttributeSet? = null) : Vi
     private val AMBER = Color.parseColor("#FF9F0A")
     private val GREEN = Color.parseColor("#4CAF50")
 
+    /**
+     * 【关键修复】绘制尺寸原本全是硬编码**像素**（textSize=34f 意思是 34px ≈ 11sp，
+     * strokeWidth=3f 在 3x 屏上经 GPU 缩放后只剩 1 个物理像素 + 抗锯齿灰边）。
+     * 结果：高密度屏上取景框细如发丝、"三分法"文字小到读不出；
+     * 反过来在 1.0x 屏上文字巨大。
+     *
+     * 现在所有 Paint 在构造后按屏幕密度统一换算成 dp 语义。
+     * （Paints 是构造期初始化的 val，只能在 init 之后统一缩放。）
+     */
+    private fun dpF(v: Float): Float = v * resources.displayMetrics.density
+
+    /**
+     * 把所有 Paint 的像素尺寸按密度换算成 dp 语义。
+     *
+     * Paint 是构造期初始化的 val，无法在初始化表达式里直接调 dpF，
+     * 因此在 View 构造完成后统一缩放一次（幂等）。
+     */
+    private fun scalePaintsToDp() {
+        val d = resources.displayMetrics.density
+        if (densityApplied == d) return
+        densityApplied = d
+        // strokeWidth 与 textSize 都是 px 语义，乘密度即为 dp 语义
+        for (p in paintList) {
+            p.strokeWidth *= d
+            p.textSize *= d
+        }
+        boxPaint.pathEffect = DashPathEffect(
+            floatArrayOf(dpF(16f), dpF(12f)), 0f
+        )
+    }
+
+    private var densityApplied = -1f
+
+    private val paintList: Array<Paint> by lazy {
+        arrayOf(
+            boxPaint, boxSolidPaint, cornerPaint, cornerSolidPaint, guidePaint,
+            pointPaint, textPaint, rulePaint, tagTextPaint, tagBgPaint,
+            checkPaint, horizonPaint, horizonLevelPaint, horizonTextPaint
+        )
+    }
+
+    init {
+        // 构造完成后立即按密度换算一次
+        // 【关键修复】原本只放在 init 里 post，一旦 View 在 attach 之前就被绘制，
+        // 或 post 队列被清理，缩放就永远不会执行（缩放函数是幂等的，
+        // onDraw 里还会再兜底调一次，不会重复乘）。
+        scalePaintsToDp()
+    }
+
     private val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = AMBER
         style = Paint.Style.STROKE
@@ -146,6 +195,10 @@ class CompositionOverlayView(context: Context, attrs: AttributeSet? = null) : Vi
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
+        // 兜底：密度可能在运行时变化（用户改系统字体/显示大小），
+        // scalePaintsToDp 内部按 densityApplied 去重，不会重复放大。
+        scalePaintsToDp()
+
         // 分析坐标 → 预览内容区 → View 坐标
         val cr = contentRect
         val hasContent = cr.width() > 1f && cr.height() > 1f
@@ -153,8 +206,8 @@ class CompositionOverlayView(context: Context, attrs: AttributeSet? = null) : Vi
         val contentH = if (hasContent) cr.height() else height.toFloat()
         val originX = if (hasContent) cr.left else 0f
         val originY = if (hasContent) cr.top else 0f
-        val kw = contentW / analysisW.coerceAtLeast(1).toFloat()
-        val kh = contentH / analysisH.coerceAtLeast(1).toFloat()
+        // 注：analysisW/analysisH 的缩放系数 kw/kh 曾在这里计算但从未被使用 ——
+        // 绘制全部按归一化坐标做，取景框与内容区只通过 origin/contentW/H 关联。
 
         val s = suggestion
 
@@ -164,7 +217,15 @@ class CompositionOverlayView(context: Context, attrs: AttributeSet? = null) : Vi
             val cy = originY + contentH / 2f
             val halfW = contentW / 2f - 40f
             val rad = Math.toRadians(s.tiltDeg.toDouble())
-            val dy = (halfW * Math.tan(rad)).toFloat()
+            // 【关键修复】原来直接算 halfW * tan(rad)，没有任何上限。
+            // tiltDeg 接近 90° 时 tan(89.9°) ≈ 57295、tan(90°) = Infinity
+            // → dy 变成 5e7 甚至 Infinity，整条线被 clip 到可视区外
+            // （看起来"参考线凭空消失"），且 Infinity 坐标喂给 Skia
+            // 会在部分后端产生 NaN 参与光栅化。
+            // 现在钳制到画布高度，既不会出现 Infinity，也不会飞出屏幕。
+            val dy = (halfW * Math.tan(rad))
+                .coerceIn(-contentH.toDouble(), contentH.toDouble())
+                .toFloat()
             canvas.drawLine(
                 cx - halfW, cy - dy,
                 cx + halfW, cy + dy,
@@ -191,8 +252,12 @@ class CompositionOverlayView(context: Context, attrs: AttributeSet? = null) : Vi
 
             // 对齐进度驱动透明度：越接近越实
             val prog = s.alignProgress.coerceIn(0f, 1f)
-            boxPaint.alpha = (90 + 165 * prog).toInt()
-            boxPaint.color = accent
+// 【关键修复】Paint.setColor() 会把 alpha 槽（color >>> 24）一并写掉。
+        // 原来这里先设 alpha 再设 color，等于把刚算好的透明度完全覆盖 ——
+        // "越对齐取景框越明显"的渐进反馈是**死代码**，永远是满不透明。
+        // 同文件 pointPaint（先 color 后 alpha）才是对的，可见是单纯顺序写反。
+        boxPaint.color = accent
+        boxPaint.alpha = (90 + 165 * prog).toInt()
 
             canvas.drawRoundRect(RectF(l, t, r, b), 16f, 16f, boxPaint)
 
@@ -242,8 +307,9 @@ class CompositionOverlayView(context: Context, attrs: AttributeSet? = null) : Vi
         // ---------- 2. AR 动态引导线（主体 → 推荐框） ----------
         if (showArGuides && !aligned && s.arLines.isNotEmpty()) {
             // 对齐进度越高线越淡，避免到位后残留
-            guidePaint.alpha = (230 * (1f - s.alignProgress.coerceIn(0f, 1f) * 0.7f)).toInt()
-            guidePaint.color = AMBER
+// 【关键修复】同上：setColor 会覆盖 alpha，必须放在 alpha 之后
+        guidePaint.color = AMBER
+        guidePaint.alpha = (230 * (1f - s.alignProgress.coerceIn(0f, 1f) * 0.7f)).toInt()
             val path = Path()
             // 只画主引导线（第一条），辅助线用更淡的短线段
             val main = s.arLines.firstOrNull()

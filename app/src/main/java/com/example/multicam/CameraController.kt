@@ -12,7 +12,6 @@ class CameraController(
     private val previewSurface: Surface?,
     private val framesPerCamera: Int,
     private val enableAIDenoise: Boolean,
-    private val enableAIUpscale: Boolean,
     var colorParams: ColorGradeParams = ColorGradeParams(),
     private val compositionEnabled: Boolean = false,
     private val compositionOverlay: ((CompositionAnalyzer.Suggestion?) -> Unit)? = null,
@@ -106,7 +105,7 @@ class CameraController(
                         onRawReady = onRawReady,
                         currentZoomProvider = { fullResSession?.getZoom() ?: 1f },
                         onZoomRequest = { z -> setZoom(z) },
-                        onJpegReady = { bytes -> processSingleAsync(bytes, "full") },
+                        onJpegReady = { bytes -> processSingleAsync(bytes) },
                         onBracketReady = onBracketFrames,
                         onError = { onError(it) },
                         onSessionReady = {
@@ -129,7 +128,7 @@ class CameraController(
                         onRawReady = onRawReady,
                         currentZoomProvider = { fullResSession?.getZoom() ?: 1f },
                         onZoomRequest = { z -> setZoom(z) },
-                        onJpegReady = { bytes -> processSingleAsync(bytes, "single") },
+                        onJpegReady = { bytes -> processSingleAsync(bytes) },
                         onBracketReady = onBracketFrames,
                         onError = { onError(it) },
                         onSessionReady = {
@@ -179,7 +178,7 @@ class CameraController(
                     onRawReady = onRawReady,
                     currentZoomProvider = { fullResSession?.getZoom() ?: 1f },
                     onZoomRequest = { z -> setZoom(z) },
-                    onJpegReady = { bytes -> processSingleAsync(bytes, "single") },
+                    onJpegReady = { bytes -> processSingleAsync(bytes) },
                     onBracketReady = onBracketFrames,
                     onError = { onError(it) },
                     onSessionReady = {
@@ -339,20 +338,15 @@ class CameraController(
     // ---------- 修改 19：AI 处理后台化 ----------
 
     /** 单摄（全像素/兜底）路径：原图立存，AI/调色后台出 */
-    private fun processSingleAsync(jpegBytes: ByteArray, tag: String) {
+    private fun processSingleAsync(jpegBytes: ByteArray) {
         onResult("raw_original", jpegBytes)
-        if (!enableAIDenoise && !enableAIUpscale &&
-            colorParams.isDefault && !autoColorEnabled()
-        ) return
+        if (!enableAIDenoise && colorParams.isDefault && !autoColorEnabled()) return
 
         BackgroundProcessor.submit("单摄 AI") { onProgress ->
             var out = jpegBytes
             if (enableAIDenoise && AIDenoise.isReady()) {
                 onProgress(20, "AI 去噪")
                 out = aiDenoise(out)
-            }
-            if (enableAIUpscale && AISuperResolution.isReady()) {
-                out = aiUpscale(out) { p, msg -> onProgress(p, msg) }
             }
             onProgress(90, "调色")
             out = applyColorGrade(out)
@@ -361,17 +355,38 @@ class CameraController(
         }
     }
 
+    /**
+     * 多摄合成的在途并发上限。
+     *
+     * 【关键修复】原来每次拍照都 `Thread { }` 新建裸线程，无池化、无背压、
+     * 不随 release() 取消。连拍 5~6 张就是 5~6 个线程同时做 OpenCV 配准与合成
+     *（每路都要解 Mat、跑 ORB、warpPerspective），CPU 打满 → 界面卡住甚至 ANR；
+     * 而且这些线程会一直持有 MainActivity 的 lambda 引用，
+     * onDestroy 后 Activity 数秒内无法回收。
+     *
+     * 现在用信号量限制并发为 1（串行），并复用后台线程池；
+     * 同时用 released 标志让生命周期结束后尽快退出。
+     */
+    private val composeSemaphore = java.util.concurrent.Semaphore(1)
+    @Volatile private var released = false
+
     /** 多摄路径：合成+调色先出，AI 后台出 */
     private fun processAsync(
         frames: Map<String, List<ByteArray>>,
         orderedIds: List<String>,
         roleMap: Map<String, CameraRole>
     ) {
-        Thread {
+        BackgroundProcessor.submit("多摄合成") { tick ->
+            // 生命周期结束后不再做重活
+            if (released) return@submit
+            // 串行执行：保证同时只有一个多摄合成在跑
+            composeSemaphore.acquire()
             try {
-                onProgress("时序降噪中…")
+                if (released) return@submit
+                tick(0, "时序降噪中…")
                 val denoised = mutableMapOf<String, ByteArray>()
                 for (id in orderedIds) {
+                    if (released) return@submit
                     val list = frames[id] ?: continue
                     val res = TemporalDenoiser.denoise(list)
                     if (res != null) {
@@ -384,38 +399,39 @@ class CameraController(
                     }
                 }
 
-                onProgress("像素级配准…")
+                tick(40, "像素级配准…")
                 val layers = orderedIds.mapNotNull { id ->
                     denoised[id]?.let {
                         ComposeLayer(id, roleMap[id] ?: CameraRole.UNKNOWN, it)
                     }
                 }
-                if (layers.isEmpty()) { onError("合成为空"); return@Thread }
+                if (layers.isEmpty()) { onError("合成为空"); return@submit }
 
-                onProgress("融合合成…")
+                tick(70, "融合合成…")
                 var composed = ImageCompositor.compose(layers)
                 composed = applyColorGrade(composed)
                 onResult("composed", composed)
 
-                if (enableAIDenoise || enableAIUpscale) {
+                if (enableAIDenoise) {
                     BackgroundProcessor.submit("多摄 AI") { onProgress2 ->
                         var out = composed
                         if (enableAIDenoise && AIDenoise.isReady()) {
                             onProgress2(30, "AI 去噪")
                             out = aiDenoise(out)
                         }
-                        if (enableAIUpscale && AISuperResolution.isReady()) {
-                            out = aiUpscale(out) { p, msg -> onProgress2(p, msg) }
-                        }
                         onProgress2(95, "保存")
                         onResult("ai_processed", out)
                     }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                // 【修复】原来只 catch(Exception)：OutOfMemoryError 继承 Error 不是
+                // Exception，会穿透到裸 Thread 顶部直接杀进程（且没有日志）。
                 AppLogger.e("CameraController", "处理失败: ${e.message}", e)
-                onError("处理失败: ${e.message}")
+                onError("处理失败: ${e.message ?: e.javaClass.simpleName}")
+            } finally {
+                composeSemaphore.release()
             }
-        }.start()
+        }
     }
 
     private fun aiDenoise(jpegBytes: ByteArray): ByteArray {
@@ -432,29 +448,6 @@ class CameraController(
             bytes
         } catch (e: Exception) {
             AppLogger.e("CameraController", "AI 去噪失败: ${e.message}", e)
-            jpegBytes
-        }
-    }
-
-    private fun aiUpscale(
-        jpegBytes: ByteArray,
-        onProgress2: ((Int, String) -> Unit)? = null
-    ): ByteArray {
-        return try {
-            val bmp = MatUtils.jpegToBitmap(jpegBytes) ?: return jpegBytes
-            val mat = MatUtils.bitmapToBgr(bmp)
-            bmp.recycle()
-            val upscaled = AISuperResolution.upscale(mat, scale = 4) { p ->
-                onProgress2?.invoke(60 + (p * 35 / 100), "AI 4× 超分 $p%")
-            }
-            mat.release()
-            val outBmp = MatUtils.bgrToBitmap(upscaled)
-            upscaled.release()
-            val bytes = MatUtils.bitmapToJpeg(outBmp, 95)
-            outBmp.recycle()
-            bytes
-        } catch (e: Exception) {
-            AppLogger.e("CameraController", "AI 超分失败: ${e.message}", e)
             jpegBytes
         }
     }
@@ -537,7 +530,16 @@ class CameraController(
         return exposureTotal + 1000L * n + 3000L
     }
 
+    /**
+     * 彻底释放（Activity onPause / onDestroy / 切录像）。
+     *
+     * 【关键修复】置 released = true，让后台正在跑的
+     * 时序降噪 / 多摄合成 / AI 推理尽快退出。
+     * 这些任务会持有 MainActivity 的 lambda 引用并持续做 OpenCV 重活，
+     * 不终止的话 Activity 销毁后数秒内无法回收，CPU 也被占满。
+     */
     fun release() {
+        released = true
         releaseInternal()
         thread.quitSafely()
     }
@@ -553,4 +555,53 @@ class CameraController(
         is CaptureMode.SingleDefault -> "兜底单摄"
         CaptureMode.Unsupported -> "不可用"
     }
+
+    /**
+     * 采集模式的**类型**标识，供 UI 判断实际用了哪种采集路径。
+     *
+     * 【新增】此前 UI（MainActivity.badgeText）只能拿到 `currentModeName()` 这个
+     * 展示用中文字符串，再用字符串去匹配模式 —— 而展示文案和匹配用的 key
+     * 并不一致（返回"三摄并发"/"兜底单摄"，UI 却匹配"多摄并发"/"单摄"），
+     * 导致永远走 else 分支，badge 显示错误的"全像素"。
+     * 改成传枚举，字符串只管显示，行为不再依赖文案。
+     */
+    fun currentModeKind(): CameraModeKind = when (mode) {
+        is CaptureMode.FullResolution -> CameraModeKind.FULL_RESOLUTION
+        is CaptureMode.MultiConcurrent -> CameraModeKind.MULTI_CONCURRENT
+        is CaptureMode.SingleDefault -> CameraModeKind.SINGLE_DEFAULT
+        CaptureMode.Unsupported -> CameraModeKind.UNSUPPORTED
+    }
+
+    /**
+     * 当前实际采集模式名（供 UI 如实展示）。
+     * 原来 UI 只根据用户意图（preferQuality）显示「全像素」，
+     * 设备不支持时会静默降级却不提示 —— 所见非所得。
+     */
+    fun currentModeName(): String = modeName(mode)
+
+    /** 用户勾选「高像素」但设备/镜头实际不支持全像素时，用于给出明确提示 */
+    fun fullResRequestedButUnavailable(): Boolean =
+        // 【修复】原来同样拿展示文案比较，改成枚举判断
+        lastPreferQuality && currentModeKind() != CameraModeKind.FULL_RESOLUTION
+}
+
+/**
+ * 实际采集路径的类型标识（供 UI 判断，而非展示）。
+ *
+ * 【新增】用来替代"用中文字符串当枚举 key"的反模式：
+ * 展示文案（`currentModeName()`）会随用户可见性/文案调整而变化，
+ * 行为判断必须依赖这个稳定的类型。
+ */
+enum class CameraModeKind {
+    /** 传感器满分辨率单摄 */
+    FULL_RESOLUTION,
+
+    /** 多摄并发 */
+    MULTI_CONCURRENT,
+
+    /** 能力不足时的兜底单摄 */
+    SINGLE_DEFAULT,
+
+    /** 设备无可用后摄 */
+    UNSUPPORTED
 }

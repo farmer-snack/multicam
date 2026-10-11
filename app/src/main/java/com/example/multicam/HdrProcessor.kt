@@ -66,14 +66,15 @@ object HdrProcessor {
 
                     // 第一帧不需要对齐（它就是基准）
                     val aligned: Mat
+                    val validMask: Mat?
                     val needRelease: Boolean
                     if (i == 0) {
-                        aligned = mats[0]; needRelease = false
+                        aligned = mats[0]; needRelease = false; validMask = null
                     } else {
                         val res = ImageAligner.align(base, mats[i])
                         aligned = res.aligned
                         needRelease = true
-                        runCatching { res.mask.release() }
+                        validMask = res.mask
                     }
 
                     try {
@@ -93,6 +94,24 @@ object HdrProcessor {
                         Core.subtract(ones, w, w)
                         ones.release()
                         g32.release()
+
+                        // 【关键修复】必须把配准掩膜乘进权重。
+                        // ImageAligner 对齐失败/视野外的区域是 BORDER_CONSTANT 0，
+                        // 那是**纯黑像素**：g=0 → w = 1-|0-1| = 0，只剩 BASE_WEIGHT=0.05。
+                        // 原实现没有乘掩膜，于是这些黑像素：
+                        //   分子贡献 0 × 0.05 = 0（没内容）
+                        //   分母却实打实加了 0.05（有计数）
+                        // 7 帧里若有 6 帧在该区域无内容：真实帧 w0=1.046 被除以
+                        // 1.046 + 6×0.05 = 1.346 → **该区域亮度掉到 77%**（暗 23%）。
+                        // 表现为"HDR 结果整体偏暗，且与清晰区域之间有一圈暗环"。
+                        if (validMask != null) {
+                            val m32 = Mat()
+                            validMask.convertTo(m32, CvType.CV_32FC1, 1.0 / 255.0)
+                            // 无效区权重归零，避免黑像素被当成"极暗但有效"的内容
+                            Core.multiply(w, m32, w)
+                            m32.release()
+                        }
+
                         // 基础权重 + 下限，防除零
                         Core.add(w, Scalar(BASE_WEIGHT), w)
 
@@ -109,7 +128,10 @@ object HdrProcessor {
 
                         a32.release(); w3.release(); aw.release(); w.release()
                     } finally {
+                        // 【修复】掩膜现在参与运算，必须在这里释放（原来在
+                        // align 之后立刻 release，导致权重拿不到有效区信息）
                         if (needRelease) runCatching { aligned.release() }
+                        if (validMask != null) runCatching { validMask.release() }
                     }
                 }
 
@@ -133,7 +155,7 @@ object HdrProcessor {
                 runCatching { acc.release() }
                 runCatching { wSum.release() }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             AppLogger.e(TAG, "HDR 合成异常: ${e.message}", e)
             return frames[0]
         } finally {

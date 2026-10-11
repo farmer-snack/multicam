@@ -3,6 +3,7 @@ package com.example.multicam
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.Scalar
 import org.opencv.imgproc.Imgproc
 
 /**
@@ -65,12 +66,32 @@ object LongExposureProcessor {
             acc = ref.clone()
             onProgress?.invoke(15, "慢门：对齐第 1/${mats.size} 帧")
 
+            // 丝绢专用：累加和 + 有效帧计数（基准帧全有效，计数起步为 1）
+            var sum: Mat? = null
+            var validCount: Mat? = null
+            if (style == Style.SILK) {
+                val s = Mat()
+                ref.convertTo(s, CvType.CV_32FC3)
+                sum = s
+                validCount = Mat.ones(ref.size(), CvType.CV_32FC1)
+            }
+
             for (i in 1 until mats.size) {
                 val res = ImageAligner.align(ref, mats[i])
                 try {
                     when (style) {
+                        // 光轨用 max：黑边像素值 0 不会抬高最大值，天然无害
                         Style.LIGHT_TRAIL -> Core.max(acc, res.aligned, acc)
-                        Style.SILK -> accumulateMean(acc, res.aligned, i + 1)
+                        // 【关键修复】丝绢必须把 mask 计入，否则黑边把画面拉到近黑。
+                        // 原实现直接丢掉 res.mask、用无条件算术平均：
+                        //   acc = acc·(n-1)/n + frame·1/n
+                        // 对齐产生的黑边（值 0）每轮都把 acc 乘 (n-1)/n，
+                        // 8 帧连乘 Π(k-1)/k = 1/8 → **有效区域被拉黑 87.5%**，
+                        // 表现为"丝绢四边发黑且越靠边越黑"（光轨正常，
+                        // 正好反证 mask 是必需的）。
+                        Style.SILK -> accumulateMeanMasked(
+                            sum!!, res.aligned, res.mask, validCount!!
+                        )
                     }
                 } finally {
                     runCatching { res.aligned.release() }
@@ -81,10 +102,13 @@ object LongExposureProcessor {
                     "慢门：合成 ${i + 1}/${mats.size} 帧"
                 )
             }
+            if (sum != null) maskedAverage(sum, validCount!!, acc)
+            sum?.let { runCatching { it.release() } }
+            validCount?.let { runCatching { it.release() } }
 
             onProgress?.invoke(90, "慢门：生成结果")
             return encode(acc)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             AppLogger.e(TAG, "慢门合成异常: ${e.message}", e)
             return frames[0]
         } finally {
@@ -105,6 +129,54 @@ object LongExposureProcessor {
         val wOld = (n - 1).toDouble() / n.toDouble()
         val wNew = 1.0 / n.toDouble()
         Core.addWeighted(acc, wOld, frame, wNew, 0.0, acc)
+    }
+
+    /**
+     * 带有效区掩膜的在线均值（增量式）。
+     *
+     * 对齐后的黑边（纯 0）不能参与平均，否则每轮都把累加值乘 (n-1)/n，
+     * 有效区域被逐渐拉黑。
+     *
+     * 维护两张图：
+     *   [sum]    —— 逐像素累加和（仅累加有效区像素）
+     *   [validCount] —— 每像素实际累加了几帧
+     * 结果 = sum / max(validCount, 1)。
+     * 这样无效像素既不进分子也不进分母，且结果与帧数无关（不会因
+     * 「某像素只参与了一半的帧」而被系统性压暗）。
+     *
+     * @param sum         累加和（跨帧累积，原地）
+     * @param validCount  有效帧计数（跨帧累积，原地）
+     */
+    private fun accumulateMeanMasked(
+        sum: Mat, frame: Mat, mask: Mat, validCount: Mat
+    ) {
+        // 有效区掩膜 → 归一化单通道浮点（0 = 无效，1 = 有效）
+        val m32 = Mat()
+        mask.convertTo(m32, CvType.CV_32FC1, 1.0 / 255.0)
+
+        // 三通道加权：只累加有效像素
+        val m3 = Mat()
+        Imgproc.cvtColor(m32, m3, Imgproc.COLOR_GRAY2BGR)
+        val weighted = Mat()
+        Core.multiply(frame, m3, weighted)
+        Core.add(sum, weighted, sum)
+        weighted.release()
+        m3.release()
+
+        // 有效帧计数：+ mask
+        Core.add(validCount, m32, validCount)
+        m32.release()
+    }
+
+    /** 由累加和 + 有效帧计数算出均值（无效像素分母取极小值，结果为 0） */
+    private fun maskedAverage(sum: Mat, validCount: Mat, out: Mat) {
+        val cnt3 = Mat()
+        Imgproc.cvtColor(validCount, cnt3, Imgproc.COLOR_GRAY2BGR)
+        val denom = Mat()
+        Core.max(cnt3, Scalar(1e-3), denom)
+        Core.divide(sum, denom, out)
+        cnt3.release()
+        denom.release()
     }
 
     private fun encode(mat: Mat): ByteArray? {

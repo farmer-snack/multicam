@@ -95,15 +95,40 @@ object AstroProcessor {
         }
     }
 
-    /** 单通道分位像素值（0..255），用直方图累积求 */
+    /**
+     * 单通道分位像素值（0..255），用直方图累积求。
+     *
+     * 【关键修复】原来写成：
+     *     Imgproc.calcHist(listOf(ch), MatOfInt(0), Mat(), hist,
+     *                      MatOfInt(256), MatOfFloat(0f, 256f))
+     * 而 OpenCV Java 的真实签名是
+     *     calcHist(images, masks, hist, ranges, nBins, ranges2)
+     * 也就是说**第二个形参是 mask 槽、第三/四个是 hist 与 ranges**。
+     * 原代码把 MatOfInt(0)（通道选择）塞进了 mask 槽、把输出 hist 塞进了
+     * ranges 槽 —— 后果是 cv::calcHist 里的
+     *     CV_Assert(mask.size() == images[0].size())
+     *     CV_Assert(histdims >= 1)
+     * **每次调用都抛 CvException**，被下面的 catch 吞掉，于是所有分位数
+     * 永久退化为整通道 min/max：
+     *   - 暗电流抑制减的是单像素极暗噪点，形同虚设
+     *   - 对比拉伸变成 min-max levels（min=0/max=255 时是恒等变换）
+     *   - 更糟：若 hi-lo 很小，alpha 被 coerce 到 1 而 beta 达 -30600，
+     *     整图被压成纯黑或纯白
+     * 现象：星空成片一片雪花噪点，低对比连续曝光帧直接全黑/全白。
+     */
     private fun percentile(ch: Mat, p: Double): Double {
         val hist = Mat()
         try {
+            // 签名（javap 实测 4.5.3）：
+            //   calcHist(images, masks:MatOfInt, hist:Mat, ranges:Mat, nBins:MatOfInt, ranges2:MatOfFloat)
+            // 第 2 位 masks 传 MatOfInt()（空 = 不屏蔽任何像素）
+            // 第 3 位 hist（输出）、第 4 位 ranges = MatOfFloat(0f, 256f)
             Imgproc.calcHist(
-                listOf(ch), MatOfInt(0), Mat(), hist,
-                MatOfInt(256), MatOfFloat(0f, 256f)
+                listOf(ch), MatOfInt(), hist, MatOfFloat(0f, 256f),
+                MatOfInt(256), MatOfFloat()
             )
             val total = ch.rows().toDouble() * ch.cols().toDouble()
+            if (total <= 0.0) return 0.0
             val target = total * p.coerceIn(0.0, 1.0)
             var acc = 0.0
             for (v in 0 until 256) {
@@ -111,8 +136,13 @@ object AstroProcessor {
                 if (acc >= target) return v.toDouble()
             }
             return 255.0
+        } catch (e: OutOfMemoryError) {
+            // OOM 必须上抛：静默退化成 min/max 会让后续拉伸把画面压成纯黑/纯白
+            throw e
         } catch (e: Exception) {
-            // 直方图不可用时退化为 min/max
+            // 直方图确实不可用时才退化（极少），且只在中位附近退化，避免
+            // 5% 分位退化成全局最小值这种最坏情况
+            AppLogger.w(TAG, "直方图失败(${e.message})，该分位退化为 min/max")
             val mm = Core.minMaxLoc(ch)
             return if (p < 0.5) mm.minVal else mm.maxVal
         } finally {

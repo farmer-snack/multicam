@@ -33,26 +33,43 @@ object ImageAligner {
         // 时序降噪/多摄合成会连续对齐几十次，累积后直接把 native heap 撑爆。
         var h: Mat? = null
         var k: Mat? = null
+        // 【关键修复】下列对象原来不在 finally 名单里，异常/早退时全部泄漏：
+        //   grayBase/grayTarget（12MP 下 24MB/次）、matches、orb、matcher、
+        //   内联的 Mat() 空掩码。
+        // 一次多摄合成要对齐 (4-1)×3=9 次，时序降噪每路再对齐 5 次，
+        // 单次拍摄泄漏 30+ 个 native 对象 → native heap 持续上涨直到 OOM。
+        var grayBase: Mat? = null
+        var grayTarget: Mat? = null
+        var matches: MatOfDMatch? = null
+        var orb: ORB? = null
+        var matcher: BFMatcher? = null
         try {
-            val orb = ORB.create(MAX_ORB_FEATURES)
+            orb = ORB.create(MAX_ORB_FEATURES)
             kpBase = MatOfKeyPoint(); kpTarget = MatOfKeyPoint()
             descBase = Mat(); descTarget = Mat()
 
-            val grayBase = Mat(); val grayTarget = Mat()
+            grayBase = Mat(); grayTarget = Mat()
             Imgproc.cvtColor(base, grayBase, Imgproc.COLOR_BGR2GRAY)
             Imgproc.cvtColor(target, grayTarget, Imgproc.COLOR_BGR2GRAY)
 
-            orb.detectAndCompute(grayBase, Mat(), kpBase, descBase)
-            orb.detectAndCompute(grayTarget, Mat(), kpTarget, descTarget)
-            grayBase.release(); grayTarget.release()
+            // 内联的 Mat() 是 native 空掩码，每次调用都新建一次且从不释放
+            val emptyMask = Mat()
+            try {
+                orb.detectAndCompute(grayBase, emptyMask, kpBase, descBase)
+                orb.detectAndCompute(grayTarget, emptyMask, kpTarget, descTarget)
+            } finally {
+                emptyMask.release()
+            }
+            grayBase.release(); grayBase = null
+            grayTarget.release(); grayTarget = null
 
             if (descBase.empty() || descTarget.empty()) {
                 AppLogger.w(TAG, "特征点为空，退化到缩放对齐")
                 return fallbackResize(base, target)
             }
 
-            val matcher = BFMatcher(Core.NORM_HAMMING, true)
-            val matches = MatOfDMatch()
+            matcher = BFMatcher(Core.NORM_HAMMING, true)
+            matches = MatOfDMatch()
             matcher.match(descTarget, descBase, matches)
 
             val good = matches.toList()
@@ -110,12 +127,20 @@ object ImageAligner {
             }
 
             return AlignResult(aligned, dstMask, true)
+        } catch (e: OutOfMemoryError) {
+            // 【修复】OOM 必须上抛：继续 fallbackResize 还要再分配 Mat()，
+            // 会引发雪崩式二次 OOM。
+            throw e
         } catch (e: Exception) {
             AppLogger.e(TAG, "对齐异常: ${e.message}", e)
             return fallbackResize(base, target)
         } finally {
             kpBase?.release(); kpTarget?.release()
             descBase?.release(); descTarget?.release()
+            grayBase?.release(); grayTarget?.release()
+            runCatching { matches?.release() }
+            runCatching { matcher?.clear() }
+            runCatching { orb?.clear() }
             runCatching { h?.release() }
             runCatching { k?.release() }
         }

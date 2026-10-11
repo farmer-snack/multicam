@@ -69,6 +69,17 @@ object SceneAdvisor {
 
     fun isLocked(): Boolean = locked
 
+    /**
+     * 设备自身的 roll 倾角（度，来自陀螺仪 / OrientationTracker）。
+     *
+     * 【新增】与「画面内容里的水平线倾角」（detectHorizon 的结果）严格区分。
+     * 只有前者能用来指导用户"转手机" —— 场景里的线歪不代表设备歪。
+     * 由 MainActivity 在传感器回调里注入；未注入（null）时不生成水平校正提示。
+     */
+    @Volatile var deviceRollDeg: Float? = null
+
+    fun setDeviceRoll(deg: Float?) { deviceRollDeg = deg }
+
     // ---------- 平滑跟随 ----------
 
     private const val SMOOTH_ALPHA = 0.28f      // EMA 系数，越小越稳越迟钝
@@ -90,6 +101,11 @@ object SceneAdvisor {
             smoothSubX = null
             smoothSubY = null
         }
+        // 【关键修复】一并复位滞回状态，否则解锁构图后三分点方向与法则名
+        // 仍带着上一次会话的记忆，取景框一上来就跳到另一侧。
+        lastSideX = 1
+        leadingStreak = 0
+        lastRule = ""
     }
 
     /** 返回平滑后的锚点；若首帧或跳变过大则返回原始值/丢弃 */
@@ -249,15 +265,33 @@ object SceneAdvisor {
         val dirHint = if (aligned) "构图合适，可以拍摄"
         else directionHintEx(subX, subY, box.centerX(), box.centerY())
 
+        // 【修复】deviceRollDeg 是 @Volatile var（会被传感器线程并发改写），
+        // Kotlin 不允许对可变属性做 smart-cast；且 when 的条件位置也不能写语句。
+        // 所以先取局部快照，再进 when。
+        val deviceRoll = deviceRollDeg
         val type: String
         val message: String
         when {
-            horizon != null && abs(sTilt) > 2.5f -> {
+            // 【关键修复】原来这里的条件是 `horizon != null && abs(sTilt) > 2.5f`，
+            // 而 sTilt 来自 detectHorizon() —— 它找的是**画面内容里**最长的
+            // 近水平直线段（屋檐、栏杆、桌面边缘、书架、地砖缝），
+            // 语义是「场景里的线歪了」，不是「设备本身歪了」。
+            // 却拿它生成「向 X 微转」的转手机指令，且这一分支会**覆盖**掉
+            // 正常的构图提示。后果双向：
+            //   - 手机端得很稳，只是画面里有条 8° 斜屋顶 → 提示「地平线右倾 8.3°」
+            //   - 手机歪了 15°，但画面里的线是水平的 → 完全不提示
+            //
+            // 现在：水平线只用于「构图法则」（choosePlan 里的"水平构图"），
+            // **不再生成转手机指令**。设备的 roll 判断交由 OrientationTracker
+            // （陀螺仪）在 MainActivity 侧做，语义正确且不误报。
+            // 这里改为基于设备自身姿态（由调用方通过 setDeviceRoll 注入）来提示。
+            deviceRoll != null && abs(deviceRoll) > 2.5f -> {
+                val roll = deviceRoll
                 type = "水平校正"
-                message = "地平线%s倾 %.1f°，向%s微转".format(
-                    if (sTilt > 0) "右" else "左",
-                    abs(sTilt),
-                    if (sTilt > 0) "左" else "右"
+                message = "手机%s倾 %.1f°，请%s转正手机".format(
+                    if (roll > 0) "右" else "左",
+                    abs(roll),
+                    if (roll > 0) "向左" else "向右"
                 )
             }
             aligned -> {
@@ -292,6 +326,17 @@ object SceneAdvisor {
             message = message,
             zoomDelta = if (recommendZoom > 0f) recommendZoom - currentZoom else 0f,
             targetZoom = recommendZoom,
+            // 【关键修复】原来 targetYawDelta 在上面算完却**没有传进 Advice**，
+            // 于是它永远是 data class 的默认值 0f。
+            // 后果（两个症状）：
+            //  1. FullRes/MultiConcurrent 的到位判定是
+            //     `abs(advice.targetYawDelta - curYaw) < 5f`，
+            //     恒等于 `abs(0 - curYaw) < 5` → 手机一动就误判"已到位"，
+            //     弹 Toast + 自动变焦；反过来真到位时也判不出来。
+            //  2. 主体在画面正中时 targetYawDelta 本应就是 0（正确），
+            //     但因为"永远 0"，任何位置都是 0，失去了全部意义。
+            // 现在把真实目标角差传下去。
+            targetYawDelta = targetYawDelta,
             guidePoints = if (aligned) listOf(rep) else listOf(rep, PointF(subX * w, subY * h)),
             horizonAngle = sTilt,
             guideAnchor = anchor,
@@ -338,8 +383,33 @@ object SceneAdvisor {
 
         val centerDist = hypot((subX - 0.5f).toDouble(), (subY - 0.5f).toDouble()).toFloat()
 
-        // 对称构图：主体接近画面中心
-        if (centerDist < 0.12f) {
+        // 【关键修复】全部判断加滞回（hysteresis）。
+        // subX/subY 虽已过 EMA 平滑（α=0.28），但主体在中线附近时仍会在 0.5
+        // 上下微颤；原来 `if (subX < 0.5f)` 没有死区 → tx 每帧在 1/3 与 2/3
+        // 之间翻转 → **取景框左右横跳、法则名在三种之间闪**（分析节流 400ms，
+        // 看起来就是"框每隔 0.4 秒弹一下"）。hasLeading 更是二值抖动源：
+        // 只要画面里有任何一条过阈值的线段就翻转。
+        // 做法：三分点选择记住上一次结果，只有偏离死区（HYSTERESIS）才换边。
+        fun pickThird(v: Float, last: Int): Int {
+            val prev = if (last == 1) 1 else 2
+            val center = 0.5f
+            // 上次选左：只有明显偏右才换右；上次选右：只有明显偏左才换左
+            val lo = if (prev == 1) center - HYSTERESIS else center
+            val hi = if (prev == 1) center else center + HYSTERESIS
+            return when {
+                v <= lo -> 1
+                v >= hi -> 2
+                else -> prev
+            }
+        }
+        val sideX = pickThird(subX, lastSideX)
+        lastSideX = sideX
+
+        // 对称构图：主体接近画面中心（用滞回避免在 0.12 边界反复穿越）
+        val symmetricNow = lastRule == "对称构图"
+        val symmetric = if (symmetricNow) centerDist < 0.16f else centerDist < 0.12f
+        if (symmetric) {
+            lastRule = "对称构图"
             return CompPlan(
                 ruleName = "对称构图",
                 box = boxAt(0.5f, 0.5f, bw, bh),
@@ -348,33 +418,64 @@ object SceneAdvisor {
         }
 
         // 引导线构图：有明确引导线且主体偏离中心
-        if (hasLeading && centerDist > 0.15f) {
+        // 【修复】hasLeading 加最小持续帧数，避免单帧线段导致法则名闪变
+        leadingStreak = if (hasLeading) leadingStreak + 1 else 0
+        if (leadingStreak >= LEADING_MIN_STREAK && centerDist > 0.15f) {
             // 框放在主体所在侧的三分点，顺引导线方向
-            val tx = if (subX < 0.5f) 1f / 3f else 2f / 3f
+            val tx = if (sideX == 1) 1f / 3f else 2f / 3f
             val ty = if (subY < 0.4f) 1f / 3f else if (subY > 0.6f) 2f / 3f else 0.5f
+            lastRule = "引导线构图"
             return CompPlan(
                 ruleName = "引导线构图",
                 box = boxAt(tx, ty, bw * 0.92f, bh * 0.92f),
-                message = "沿引导线把主体放到%s三分点".format(if (subX < 0.5f) "左" else "右")
+                message = "沿引导线把主体放到%s三分点".format(if (sideX == 1) "左" else "右")
             )
         }
 
         // 三分法：最通用，把主体吸附到最近的三分点
-        val tx = if (subX < 0.5f) 1f / 3f else 2f / 3f
+        // 【关键修复】原来无论主体竖直位置如何，ty 都被硬拉到 1/3 或 2/3 ——
+        // 只要画面里检测到一条近水平线（窗框/桌面边缘/地平线）且主体偏中心，
+        // 就完全忽略水平关系，直接建议"把主体移到上/下三分点"。
+        // 现在：水平线存在且主体已接近垂直中线时，给出「水平构图」——
+        // 保持水平、只微调垂直位置，这才是水平构图法则的意义
+        // （同时让 hasHorizon 这个参数真正被使用，不再是死参数）。
+        if (hasHorizon && subY in 0.4f..0.6f) {
+            lastRule = "水平构图"
+            val hx = if (sideX == 1) 1f / 3f else 2f / 3f
+            val hSide = if (sideX == 1) "左" else "右"
+            return CompPlan(
+                ruleName = "水平构图",
+                box = boxAt(hx, 0.5f, bw, bh),
+                message = "沿水平线构图，主体保持在" + hSide + "三分点并压低地平线"
+            )
+        }
+
+        val tx = if (sideX == 1) 1f / 3f else 2f / 3f
         val ty = if (subY < 0.5f) 1f / 3f else 2f / 3f
+        lastRule = "三分法"
         return CompPlan(
             ruleName = "三分法",
             box = boxAt(tx, ty, bw, bh),
             message = "把主体移入%s三分点取景框".format(
                 when {
-                    subX < 0.5f && subY < 0.5f -> "左上"
-                    subX >= 0.5f && subY < 0.5f -> "右上"
-                    subX < 0.5f -> "左下"
+                    sideX == 1 && subY < 0.5f -> "左上"
+                    sideX == 2 && subY < 0.5f -> "右上"
+                    sideX == 1 -> "左下"
                     else -> "右下"
                 }
             )
         )
     }
+
+    /** 三分点左右选择的滞回死区（相对中线 0.5 的偏移） */
+    private const val HYSTERESIS = 0.06f
+
+    /** 引导线需连续命中这么多帧才认定，避免法则名闪变 */
+    private const val LEADING_MIN_STREAK = 3
+
+    @Volatile private var lastSideX = 1
+    @Volatile private var leadingStreak = 0
+    @Volatile private var lastRule = ""
 
     /** 以归一化中心点构造推荐框，自动钳制在画面内 */
     private fun boxAt(cx: Float, cy: Float, bw: Float, bh: Float): android.graphics.RectF {
@@ -401,13 +502,25 @@ object SceneAdvisor {
      */
     private fun recommendZoomFor(subjectArea: Float, currentZoom: Float): Float {
         if (subjectArea <= 0.001f) return 0f   // 没识别到主体，不推荐
-        val ideal = 0.12f
+        // 【关键修复】ideal 由 0.12 改为 0.30。
+        // subjectArea = (2r/w)×(2r/h)，而 r 是**整幅画面 Canny 边缘点的空间标准差**，
+        // 不是主体大小。边缘近似均匀铺满时 std ≈ 0.29×边长 →
+        // subjectArea ≈ (0.58)² ≈ 0.34。
+        // 原 ideal=0.12 使得 ratio = sqrt(0.12/0.34) ≈ 0.59 **恒小于 1**，
+        // 推荐方向永远是"拉远"，注释里写的"占比过小则倍率放大"永远不会触发，
+        // 且用户手动拉到 10× 后会被自动变焦慢慢拽回来。
+        // 把 ideal 提到 0.30（贴近边缘分布的实际中位）后，
+        // ratio 才能同时覆盖"放大"与"拉远"两个方向。
+        val ideal = 0.30f
         val ratio = kotlin.math.sqrt(ideal / subjectArea)
         val target = (currentZoom * ratio).coerceIn(1f, 6f)
         if (abs(target - currentZoom) < 0.15f) return 0f  // 差异太小，不打扰
-        // 吸附到常用档位：1.0 / 1.5 / 2.0 / 3.0 / 4.0 / 5.0 / 6.0
+        // 吸附到常用档位
         val stops = floatArrayOf(1f, 1.5f, 2f, 3f, 4f, 5f, 6f)
-        return stops.minByOrNull { abs(it - target) } ?: target
+        val snapped = stops.minByOrNull { abs(it - target) } ?: target
+        // 【修复】吸附后若与当前几乎相同就不要推荐，
+        // 否则会在 1.0↔1.5 之间形成极限环振荡（每 400ms 跳一次）
+        return if (abs(snapped - currentZoom) < 0.15f) 0f else snapped
     }
 
     /**

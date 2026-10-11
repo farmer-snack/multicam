@@ -169,11 +169,15 @@ object PanoramaStitcher {
 
             val bmp = MatUtils.bgrToBitmap(out8)
             out8.release()
-            val bytes = MatUtils.bitmapToJpeg(bmp, 95)
+val bytes = MatUtils.bitmapToJpeg(bmp, 95)
             bmp.recycle()
             return bytes
-        } catch (e: Exception) {
-            AppLogger.e("Panorama", "拼接异常: ${e.message}", e)
+        } catch (e: Throwable) {
+            // 【修复】原来只 catch(Exception)：全景画布是 CV_32FC3，
+            // 每个画布像素 12 字节 + 权重图 4 字节，3 帧典型画布就 ~580MB，
+            // OutOfMemoryError（Error 不是 Exception）会穿透到线程池直接杀进程。
+            // 现在顶层接住 Throwable，转换成"拼接失败"返回 null，由 UI 提示。
+            AppLogger.e("Panorama", "拼接失败: ${e.message}", e)
             return null
         } finally {
             mats.forEach { runCatching { it.release() } }
@@ -191,20 +195,38 @@ object PanoramaStitcher {
         var kpTarget: MatOfKeyPoint? = null
         var descBase: Mat? = null
         var descTarget: Mat? = null
+        // 【关键修复】下面这些原来全部不在 finally 里，异常与早退时都会泄漏：
+        // grayBase/grayTarget、matches、srcPts/dstPts、orb、matcher、内联 Mat()。
+        // 其中 `return null`（特征不足 / good 不足 / findHomography 失败）
+        // 是**全景扫描的常规路径**而非异常路径 —— 平移过快或重复纹理时每帧都命中，
+        // 所以这是高频泄漏。单次全景 8 帧就是 16 次 align，每次漏 5+ 个 native 对象。
+        var grayBase: Mat? = null
+        var grayTarget: Mat? = null
+        var matches: MatOfDMatch? = null
+        var srcPts: MatOfPoint2f? = null
+        var dstPts: MatOfPoint2f? = null
+        var orb: ORB? = null
+        var matcher: BFMatcher? = null
         return try {
-            val orb = ORB.create(MAX_ORB_FEATURES)
+            orb = ORB.create(MAX_ORB_FEATURES)
             kpBase = MatOfKeyPoint(); kpTarget = MatOfKeyPoint()
             descBase = Mat(); descTarget = Mat()
-            val grayBase = Mat(); val grayTarget = Mat()
+            grayBase = Mat(); grayTarget = Mat()
             Imgproc.cvtColor(base, grayBase, Imgproc.COLOR_BGR2GRAY)
             Imgproc.cvtColor(target, grayTarget, Imgproc.COLOR_BGR2GRAY)
-            orb.detectAndCompute(grayBase, Mat(), kpBase, descBase)
-            orb.detectAndCompute(grayTarget, Mat(), kpTarget, descTarget)
-            grayBase.release(); grayTarget.release()
+            val emptyMask = Mat()
+            try {
+                orb.detectAndCompute(grayBase, emptyMask, kpBase, descBase)
+                orb.detectAndCompute(grayTarget, emptyMask, kpTarget, descTarget)
+            } finally {
+                emptyMask.release()
+            }
+            grayBase.release(); grayBase = null
+            grayTarget.release(); grayTarget = null
             if (descBase.empty() || descTarget.empty()) return null
 
-            val matcher = BFMatcher(Core.NORM_HAMMING, true)
-            val matches = MatOfDMatch()
+            matcher = BFMatcher(Core.NORM_HAMMING, true)
+            matches = MatOfDMatch()
             matcher.match(descTarget, descBase, matches)
             val good = matches.toList()
                 .filter { it.distance < GOOD_MATCH_DIST }
@@ -213,21 +235,33 @@ object PanoramaStitcher {
 
             val kpA = kpTarget.toArray()
             val kpB = kpBase.toArray()
-            val srcPts = MatOfPoint2f(
+            srcPts = MatOfPoint2f(
                 *good.map { kpA[it.queryIdx].pt }.toTypedArray()
             )
-            val dstPts = MatOfPoint2f(
+            dstPts = MatOfPoint2f(
                 *good.map { kpB[it.trainIdx].pt }.toTypedArray()
             )
             val h = Calib3d.findHomography(srcPts, dstPts, Calib3d.RANSAC, 5.0)
             if (h == null || h.empty()) return null
-            srcPts.release(); dstPts.release(); matches.release()
-            h
+            // 所有权转移给调用方，finally 里不再释放
+            val ret = h
+            srcPts = null; dstPts = null; matches = null
+            ret
+        } catch (e: OutOfMemoryError) {
+            // 【修复】OOM 必须上抛：全景画布本来就吃内存，静默退化成"相邻帧"会
+            // 产出一张完全错位的废图，用户以为"全景坏了"。
+            throw e
         } catch (e: Exception) {
             null
         } finally {
             kpBase?.release(); kpTarget?.release()
             descBase?.release(); descTarget?.release()
+            grayBase?.release(); grayTarget?.release()
+            runCatching { matches?.release() }
+            runCatching { srcPts?.release() }
+            runCatching { dstPts?.release() }
+            runCatching { matcher?.clear() }
+            runCatching { orb?.clear() }
         }
     }
 }

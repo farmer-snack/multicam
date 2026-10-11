@@ -8,7 +8,6 @@ object SettingsStore {
 
     private const val KEY_PREFER_QUALITY = "prefer_quality"
     private const val KEY_FRAMES = "frames_per_camera"
-    private const val KEY_AI = "enable_ai_upscale"
     private const val KEY_DENOISE = "enable_ai_denoise"
     private const val KEY_MIRROR = "mirror_x"
     private const val KEY_EXTRA_ROT = "extra_rotation"
@@ -36,13 +35,6 @@ object SettingsStore {
 
     fun saveFrames(context: Context, v: Int) {
         sp(context).edit().putInt(KEY_FRAMES, v).apply()
-    }
-
-    fun loadAI(context: Context, def: Boolean = false): Boolean =
-        sp(context).getBoolean(KEY_AI, def)
-
-    fun saveAI(context: Context, v: Boolean) {
-        sp(context).edit().putBoolean(KEY_AI, v).apply()
     }
 
     fun loadDenoise(context: Context, def: Boolean = false): Boolean =

@@ -204,13 +204,27 @@
             android:visibility="gone" />
 
         <!-- 变焦倍率条 -->
-        <LinearLayout
-            android:id="@+id/zoomRow"
+        <!-- 【修复】原来 zoomRow 是裸 LinearLayout，三摄机型上
+             1/1.5/2/3/5/10 共 6 个 pill × 约 62dp = 372dp，
+             超出可用宽度（360dp - 36dp padding = 324dp）→
+             最右边的「10×」被挤出屏幕，点不到也滑不动。
+             modeStrip / quickRow / filterRow 都已包 HorizontalScrollView，唯独它漏了。 -->
+        <HorizontalScrollView
+            android:id="@+id/zoomRowScroll"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginBottom="14dp"
-            android:gravity="center"
-            android:orientation="horizontal" />
+            android:fillViewport="true"
+            android:scrollbars="none">
+
+            <LinearLayout
+                android:id="@+id/zoomRow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:gravity="center"
+                android:orientation="horizontal" />
+        </HorizontalScrollView>
 
         <!-- ============ 【新增】底部横向快捷开关行（vivo 风格） ============ -->
         <HorizontalScrollView

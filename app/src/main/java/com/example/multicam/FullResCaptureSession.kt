@@ -18,6 +18,7 @@ import org.opencv.core.CvType
 import org.opencv.core.Mat
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 /**
  * 全像素/单摄会话（含修改 12–24 部分）：
@@ -119,11 +120,16 @@ class FullResCaptureSession(
             device = camera; createSession(camera)
         }
         override fun onDisconnected(camera: CameraDevice) {
+            // 【关键修复】校验身份：上一代设备的断开回调迟到时，原来会无条件
+            // device = null，把正在用的新设备字段抹掉 → 后续所有 setRepeatingRequest
+            // 抛异常，且那颗设备永不被 close。
+            if (device !== camera) { runCatching { camera.close() }; return }
             runCatching { camera.close() }; device = null
             if (stopped) return
             scheduleRetry("相机断开")
         }
         override fun onError(camera: CameraDevice, error: Int) {
+            if (device !== camera) { runCatching { camera.close() }; return }
             runCatching { camera.close() }; device = null
             if (stopped) return
             scheduleRetry("相机错误 code=$error")
@@ -236,34 +242,56 @@ class FullResCaptureSession(
                 }
             }
 
+            val ex = java.util.concurrent.Executors.newSingleThreadExecutor()
+            synchronized(execLock) { sessionExecutor = ex }
             val config = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
                 outputs,
-                Executors.newSingleThreadExecutor(),
+                ex,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
-                        session = s
-                        previewRequestBuilder = camera.createCaptureRequest(
-                            CameraDevice.TEMPLATE_PREVIEW
-                        ).apply {
-                            previewSurface?.let { addTarget(it) }
-                            // 修复 21：分析流必须进重复请求，否则收不到帧
-                            analysisReader?.let { addTarget(it.surface) }
-                            applyControlsTo(this)
+                        // 【关键修复】这里原先漏了 stopped 守卫（onOpened/onDisconnected/
+                        // onError 都加了，唯独这个没加）。stop() 与 onConfigured 之间没有任何
+                        // 同步：会话已配好但设备已被关闭时，下面这行
+                        // camera.createCaptureRequest() 会抛 IllegalStateException，
+                        // 而异常是抛进 SessionConfiguration 的 ExecutorService ——
+                        // ThreadPoolExecutor 不捕获任务异常，直接走
+                        // Thread.dispatchUncaughtException **杀进程**。
+                        if (stopped) { runCatching { s.close() }; return }
+                        runCatching {
+                            session = s
+                            previewRequestBuilder = camera.createCaptureRequest(
+                                CameraDevice.TEMPLATE_PREVIEW
+                            ).apply {
+                                previewSurface?.let { addTarget(it) }
+                                // 修复 21：分析流必须进重复请求，否则收不到帧
+                                analysisReader?.let { addTarget(it.surface) }
+                                applyControlsTo(this)
+                            }
+                            startPreviewLoop(s)
+                            onSessionReady()
+                        }.onFailure { e ->
+                            AppLogger.e("FullRes", "配置会话后初始化失败", e)
+                            runCatching { s.close() }
                         }
-                        startPreviewLoop(s)
-                        onSessionReady()
                     }
                     override fun onConfigureFailed(s: CameraCaptureSession) {
+                        if (stopped) return
                         scheduleRetry("会话配置失败")
                     }
                 }
             )
             camera.createCaptureSession(config)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // 【修复】原来只 catch(Exception)：OOM / UnsatisfiedLinkError 会穿透
+            AppLogger.e("FullRes", "创建会话异常", e)
             scheduleRetry("创建会话异常: ${e.message}")
         }
     }
+
+    /** 会话回调 Executor：stop() 必须 shutdown，否则每次重开相机漏一个线程 */
+    private val execLock = Any()
+    private var sessionExecutor: java.util.concurrent.ExecutorService? = null
 
     private fun startPreviewLoop(s: CameraCaptureSession) {
         val builder = previewRequestBuilder ?: return
@@ -290,8 +318,19 @@ class FullResCaptureSession(
             val advice = SceneAdvisor.analyze(gray, currentZoomProvider())
             if (advice != null) {
                 compositionOverlay?.invoke(toSuggestion(advice))
+                // 【关键修复】自动变焦原来每 400ms 无条件下发，
+                // 且没有「用户正在手动调焦」的检测 → 用户手动拉到 10× 后会被
+                // 自动变焦慢慢拽回来；配合档位吸附还会形成 1.0↔1.5 极限环振荡。
+                // 现在：① 结果必须与当前实际倍率有实质差异才下发；
+                //      ② 下发后记住所需倍率，短时间内不再重复下发。
                 if (autoZoomEnabled && advice.targetZoom > 0f) {
-                    onZoomRequest?.invoke(advice.targetZoom)
+                    val cur = currentZoomProvider()
+                    if (abs(advice.targetZoom - cur) > 0.15f &&
+                        abs(advice.targetZoom - lastAutoZoom) > 0.01f
+                    ) {
+                        lastAutoZoom = advice.targetZoom
+                        onZoomRequest?.invoke(advice.targetZoom)
+                    }
                 }
                 // 修改 27：陀螺仪到位判断 —— 手机转到建议位置后触发变焦/调色
                 val curYaw = getYaw?.invoke() ?: 0f
@@ -320,6 +359,9 @@ class FullResCaptureSession(
 
     /** 到位提示锁存：避免每 400ms 重复触发 */
     @Volatile private var targetReachedLatched = false
+
+    /** 上次自动变焦下发的目标倍率，用于去重、避免极限环振荡 */
+    @Volatile private var lastAutoZoom = 0f
 
     private fun yuvToGray(image: Image): Mat {
         val plane = image.planes[0]
@@ -723,6 +765,12 @@ class FullResCaptureSession(
     /** 【新增】兜底：超时后把已收到的帧交出去（可能少于期望帧数） */
     private fun flushBracketIfTimeout() {
         if (bracketExpect <= 0) return
+        // 【关键修复】代际号校验。同文件 focusCancelToken 已经用过这个套路，
+        // 但超时兜底漏了：第 N 拍的兜底任务排在 t0+24s，若用户在星空/慢门
+        // 采集期间切模式再拍一轮，第 N 拍的兜底会醒来把**新一轮**的
+        // droppedRound 置 true（→ 新轮所有帧被丢弃）、capturing 清掉、
+        // bracketBuf 提前交付 → HDR 直接夭折。
+        if (captureRound != bracketRound) { AppLogger.d("FullRes", "跳过过期的包围兜底"); return }
         // 【关键修复】原来超时把 bracketExpect 清 0，但那一轮的其余帧还在路上。
         // 它们到达时看到 expect<=0 → 走单张路径 onJpegReady → 存成"原图"，
         // 于是 HDR 拍 7 帧只回 3 帧时，相册里除了合成图还多出 4 张满分辨率废片。
@@ -752,12 +800,29 @@ class FullResCaptureSession(
     @Volatile private var droppedRound = false
 
     /**
+     * 【关键修复】拍摄代际号。
+     * 包围/单张的超时兜底用 postDelayed 排程，而包围模式的超时窗口长达
+     * 10~40s（星空 4×4s、慢门 8×2s）。若不给兜底任务绑定代际号，上一轮
+     * 排下的兜底会醒来把**新一轮**的状态清掉（droppedRound / capturing /
+     * bracketBuf），表现为"连拍第二张只合成出 2~3 帧"或"两组帧交错"。
+     * focusCancelToken 已经是这个套路，这里补齐到快门链路上。
+     */
+    @Volatile private var captureRound = 0L
+
+    /** 排程兜底任务时捕获的代际号 */
+    @Volatile private var bracketRound = -1L
+
+    /**
      * 【新增】单张拍照的兜底：若 JPEG 与 onCaptureCompleted 都没来（HAL 丢帧、
      * 会话被抢占等），超时后强制复位 capturing，避免快门永久失效。
      * 已在 [dispatchJpeg] 里复位过则此方法为无操作。
      */
     private fun clearCaptureGuardIfIdle() {
         if (bracketExpect > 0) return
+        // 【关键修复】代际号校验：单张兜底排在 t0+8s，第 N+1 拍在 t0+1s 开始后，
+        // 这个过期的兜底会把第 N+1 拍的 capturing 清掉 → 用户在成像期间就能再按
+        // → 两组 STILL_CAPTURE 交错 stopRepeating/capture，帧序错乱。
+        if (captureRound != bracketRound) { AppLogger.d("FullRes", "跳过过期的单张兜底"); return }
         if (capturing) {
             AppLogger.w("FullRes", "单张拍照超时兜底，复位快门状态")
             capturing = false
@@ -778,8 +843,10 @@ class FullResCaptureSession(
         }
         capturing = true
         lastCaptureAt = now
-        // 【关键修复】新的一轮开始，必须复位上一轮的"已降级交付"标志，
-        // 否则本轮所有帧都会被 dispatchJpeg 当残余帧丢弃 → 一张都存不出来。
+        // 【关键修复】进入新一轮：递增代际号 + 复位上一轮的"已降级交付"标志。
+        // 否则本轮所有帧都会被 dispatchJpeg 当残余帧丢弃 → 一张都存不出来；
+        // 上一轮遗留的兜底任务也会误伤本轮状态。
+        captureRound++
         droppedRound = false
 
         val plan = controls.bracket
@@ -857,12 +924,23 @@ class FullResCaptureSession(
                 }
                 val perFrameOverhead = if (useMaximumResolution) 1200L else 500L
                 val timeoutMs = exposureTotal + perFrameOverhead * frameCount + 3000L
-                handler?.postDelayed({ flushBracketIfTimeout() }, timeoutMs)
+                // 【关键修复】绑定本轮代际号，防止上一轮遗留的兜底误伤新一轮
+                val round = captureRound
+                bracketRound = round
+                handler?.postDelayed({
+                    if (captureRound != round) { AppLogger.d("FullRes", "丢弃过期的包围兜底任务"); return@postDelayed }
+                    flushBracketIfTimeout()
+                }, timeoutMs)
             } else {
                 // 【新增】单张拍照同样加超时兜底：JPEG 落盘 + onCaptureCompleted
                 // 若都没回来（断流/被抢占），快门会永久卡住。
                 val timeoutMs = if (useMaximumResolution) 8000L else 5000L
-                handler?.postDelayed({ clearCaptureGuardIfIdle() }, timeoutMs)
+                val round = captureRound
+                bracketRound = round
+                handler?.postDelayed({
+                    if (captureRound != round) { AppLogger.d("FullRes", "丢弃过期的单张兜底任务"); return@postDelayed }
+                    clearCaptureGuardIfIdle()
+                }, timeoutMs)
             }
 
             // RAW 通道：独立提交，单独保存 result
@@ -902,6 +980,11 @@ class FullResCaptureSession(
         // 这里先作废所有悬挂任务、复位快门与包围状态，避免重开相机时
         // 因 capturing=true 而"快门点了没反应"。
         handler?.removeCallbacksAndMessages(null)
+        // 【关键修复】会话回调 Executor 必须 shutdown。原来它在 createSession 里
+        // 内联 newSingleThreadExecutor() 后引用被丢弃，stop() 无从关闭 →
+        // 每次重开相机（切模式/开关 RAW/前后台）都漏一个非 daemon 线程，
+        // 切几十次后线程数暴涨 → ANR / Thread creation failed。
+        synchronized(execLock) { sessionExecutor?.shutdown() }
         focusCancelToken++
         capturing = false
         bracketExpect = 0

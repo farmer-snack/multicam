@@ -13,6 +13,9 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * AI 去噪（NafNet 类模型）。
@@ -32,6 +35,9 @@ object AIDenoise {
     private const val OVERLAP = 12
     private const val MAX_INPUT = 1600
     private const val TILE_TIMEOUT_MS = 6000L
+
+    /** 模型输出值域系数：NafNet 输出 0–1，乘 255 到像素域 */
+    private const val OUT_SCALE = 255.0
 
     private var interpreter: Interpreter? = null
     private var useNnApi = false
@@ -97,16 +103,58 @@ object AIDenoise {
         if (maxDim > MAX_INPUT) {
             val k = MAX_INPUT.toDouble() / maxDim
             val tmp = Mat()
+            // 【关键修复】缩小必须用 INTER_AREA。
+            // 原来用默认的 INTER_LINEAR（只取 4 个相邻像素做双线性），
+            // 对 4032→1600 这种非整数倍缩小是**欠采样**：树叶/砖墙/发丝混叠，
+            // 传感器噪声被同样地点采样带进来 —— 去噪的输入本身已带采样误差，
+            // 降噪效果被锁死、边缘出白边锯齿。
             Imgproc.resize(
                 input, tmp,
-                org.opencv.core.Size(input.cols() * k, input.rows() * k)
+                org.opencv.core.Size(input.cols() * k, input.rows() * k),
+                0.0, 0.0, Imgproc.INTER_AREA
             )
             src = tmp
             scaledDown = true
         }
 
-        val h = src.rows()
+        onProgress?.invoke(0)
+
+        // 【新增】任何一块超时 → 整图放弃去噪并原图返回。
+        val output = try {
+            denoiseLoop(src, interp, onProgress)
+        } catch (e: TileTimeoutException) {
+            AppLogger.w(TAG, "去噪超时，返回原图（未降噪）")
+            runCatching { src.release() }
+            onProgress?.invoke(100)
+            return input.clone()
+        }
+
+        // 2. 降采样过则缩回原尺寸
+        if (scaledDown) {
+            val resized = Mat()
+            // 【修复】原来用默认的 INTER_LINEAR。从最长边 1600 放回 4032 是 2.5x
+            // 放大，双线性只取 4 个邻点 → 细节被抹平，AI 成片比原图明显发糊。
+            // 改用 INTER_CUBIC（4 邻点双三次），放大后锐度明显更好，
+            // 且只在每张图最后执行一次，性能可接受。
+            Imgproc.resize(
+                output, resized,
+                org.opencv.core.Size(input.cols().toDouble(), input.rows().toDouble()),
+                0.0, 0.0, Imgproc.INTER_CUBIC
+            )
+            output.release()
+            src.release()
+            onProgress?.invoke(100)
+            return resized
+        }
+
+        onProgress?.invoke(100)
+        return output
+    }
+
+    /** 分块推理主体；超时抛 [TileTimeoutException] 由 [denoise] 统一回退 */
+    private fun denoiseLoop(src: Mat, interp: Interpreter, onProgress: ((Int) -> Unit)?): Mat {
         val w = src.cols()
+        val h = src.rows()
         val output = Mat.zeros(h, w, CvType.CV_8UC3)
         val step = TILE - OVERLAP
         // 修复：w <= OVERLAP 时 ((w - OVERLAP) + step - 1) / step 会算出 0 列 → 整图不处理。
@@ -115,8 +163,6 @@ object AIDenoise {
         val rows = (((h - OVERLAP) + step - 1) / step).coerceAtLeast(1)
         val total = (cols * rows).coerceAtLeast(1)
         var done = 0
-
-        onProgress?.invoke(0)
 
         for (ty in 0 until rows) {
             for (tx in 0 until cols) {
@@ -174,38 +220,69 @@ object AIDenoise {
             }
         }
 
-        // 2. 降采样过则缩回原尺寸
-        if (scaledDown) {
-            val resized = Mat()
-            Imgproc.resize(
-                output, resized,
-                org.opencv.core.Size(input.cols().toDouble(), input.rows().toDouble())
-            )
-            output.release()
-            src.release()
-            onProgress?.invoke(100)
-            return resized
-        }
-
-        onProgress?.invoke(100)
         return output
     }
 
-    /** 带超时保护的整块推理；超时或异常返回 null，由调用方回退原图 */
+    /**
+     * 带超时保护的整块推理；超时或异常返回 null，由调用方回退原图。
+     *
+     * 【关键修复】原来注释写着"带超时保护"，但 TILE_TIMEOUT_MS 只在推理
+     * **返回之后**用来打一行日志，没有任何 Future.get(timeout) / 中断机制 ——
+     * NNAPI 在某些机型上单块可卡到几十秒甚至永久挂起，而 BackgroundProcessor
+     * 是**单线程 + 每任务后 sleep 3s**，于是整个 AI 队列彻底堵死、
+     * UI 永远停在"处理中"。
+     *
+     * 现在用单次执行器 + Future.get(timeout) 实现真实超时：
+     * 超时后 cancel(true) 发出中断信号并放弃该块（保留原图兜底）。
+     *
+     * 注意：TFLite 的 native 推理不响应线程中断，cancel 只是让等待方返回、
+     * 后台线程可能仍在跑完这一块 —— 但至少 UI 与后续流程不会被无限阻塞。
+     */
     private fun runTileSafe(interp: Interpreter, tile: Mat): Mat? {
         val start = System.currentTimeMillis()
+        val exec = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "DenoiseTile").apply { isDaemon = true }
+        }
         return try {
-            val r = runTile(interp, tile)
+            val future = exec.submit<Mat?> { runTile(interp, tile) }
+            val r = try {
+                future.get(TILE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            } catch (e: TimeoutException) {
+                AppLogger.w(TAG, "tile 推理超时 ${TILE_TIMEOUT_MS}ms，整图放弃去噪")
+                future.cancel(true)
+                // 【关键修复】超时**必须让整张图放弃去噪**，而不是跳过这块继续下一块。
+                //
+                // TFLite 的 native 推理不响应 Java 线程中断，`cancel(true)` 之后
+                // 那个 run() 很可能仍在驱动的 NNAPI/GPU 上跑着。如果此时主循环
+                // 用**同一个 Interpreter** 处理下一块，就会出现两个线程并发调用
+                // Interpreter.run() —— TFLite 对此没有任何同步保护，内部张量缓冲
+                // 被同时读写，结果是随机崩溃/花屏，而不只是算错。
+                //
+                // 同一个 Mat 也仍在被后台线程读（runTile 里的 rgb/resized），
+                // 主循环却已经把它 release() → native use-after-free。
+                //
+                // 所以这里抛出，由 [denoise] 统一回退成"输出原图"，
+                // 保证结果确定（宁可不降噪，也不能崩或花屏）。
+                throw TileTimeoutException()
+            }
             val cost = System.currentTimeMillis() - start
             if (cost > TILE_TIMEOUT_MS) {
-                AppLogger.w(TAG, "tile 推理超时 ${cost}ms，继续下一块")
+                AppLogger.w(TAG, "tile 耗时 ${cost}ms")
             }
             r
+        } catch (e: TileTimeoutException) {
+            // 超时必须冒泡给 [denoise]（见上面的说明），不能在这里吞掉
+            throw e
         } catch (e: Exception) {
             AppLogger.w(TAG, "tile 推理失败: ${e.message}")
             null
+        } finally {
+            runCatching { exec.shutdownNow() }
         }
     }
+
+    /** 单块推理超时：整图放弃去噪（而不是继续下一块，避免 Interpreter 并发） */
+    private class TileTimeoutException : RuntimeException("tile inference timeout")
 
     /** 单块推理：把 tile 缩放到模型输入尺寸，推理后缩放回 tile 尺寸 */
     private fun runTile(interp: Interpreter, tile: Mat): Mat {
@@ -321,13 +398,19 @@ object AIDenoise {
                     } else {
                         System.arraycopy(f, 0, hwc, 0, outSize)
                     }
-                    val out32 = Mat(outH, outW, CvType.CV_32FC3)
+val out32 = Mat(outH, outW, CvType.CV_32FC3)
                     out32.put(0, 0, hwc)
-                    // 归一化量级自适应：平面归一模型输出 0..1，直出模型输出 0..255
-                    var peak = 0f
-                    for (v in hwc) if (v > peak) peak = v
-                    val scale = if (peak <= 1.5f) 255.0 else 1.0
-                    out32.convertTo(outMat, CvType.CV_8UC3, scale, 0.0)
+                    // 【关键修复】删除"逐块探测输出值域"的逻辑。
+                    // 原来是：
+                    //     var peak = 0f; for (v in hwc) if (v > peak) peak = v
+                    //     val scale = if (peak <= 1.5f) 255.0 else 1.0
+                    // 问题在于这是**逐块**判断，而分块有几十块：
+                    // 夜景/室内场景里任意一块暗区（欠曝角落、阴影）peak 可能只有
+                    // 0.1~0.3，被误判成 0–1 → 该块 ×255 → saturate 成纯白方块，
+                    // 表现为"降噪后图上偶发一块惨白色块"。
+                    // 模型契约是明确的（NafNet 输出 0–1，见 assets/README.txt），
+                    // 与 AISuperResolution 保持一致固定 ×255，行为确定、无隐式状态。
+                    out32.convertTo(outMat, CvType.CV_8UC3, OUT_SCALE, 0.0)
                     out32.release()
                 }
                 DataType.UINT8, DataType.INT8 -> {
@@ -378,9 +461,15 @@ object AIDenoise {
     }
 
     private fun loadModel(context: Context, name: String): MappedByteBuffer {
+        // 【关键修复】原来 openFd 与 FileInputStream 都没关，fd 一直被 APK 的
+        // 映射窗口引用；map() 抛异常时更是彻底泄漏。
+        // 注意 MappedByteBuffer 在 channel 关闭后仍然有效，这是 FileChannel.map
+        // 的既定语义，不是 use-block 的副作用。
         val afd = context.assets.openFd(name)
-        val fis = FileInputStream(afd.fileDescriptor)
-        val fc = fis.channel
-        return fc.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength)
+        FileInputStream(afd.fileDescriptor).use { fis ->
+            return fis.channel.map(
+                FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.declaredLength
+            )
+        }
     }
 }

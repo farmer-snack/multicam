@@ -4,18 +4,25 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
+    <!-- 【修复】原来 pathData 是 "M12,3 m-9,0 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0"。
+         m-9,0 把起点挪到 (3,3)，而弦长 18 = 2r 正好是直径，
+         于是圆心 = 弦中点 = (12,3)、半径 9 → 纵向覆盖 y∈[-6,12]，
+         顶部 6 个单位（直径的 1/4）落在 viewport 外被裁掉 ——
+         顶栏"调色"按钮的图标看起来像个被削平的碗。
+         修正：以圆心 (12,12) 为基准，半径 9，四分弧拼成整圆。 -->
     <path
         android:fillColor="#00000000"
-        android:pathData="M12,3 m-9,0 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0"
+        android:pathData="M12,3 a9,9 0 1,0 0,18 a9,9 0 1,0 0,-18"
         android:strokeColor="#FFFFFFFF"
         android:strokeWidth="1.6" />
+    <!-- 三个色点：必须落在圆内（圆心 12,12 半径 9） -->
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M9,9 m-1.7,0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0" />
+        android:pathData="M9.2,9.6 m-1.7,0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0" />
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M15,9.5 m-1.7,0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0" />
+        android:pathData="M15,9.2 m-1.7,0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0" />
     <path
         android:fillColor="#FFFFFFFF"
-        android:pathData="M11,15.5 m-1.7,0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0" />
+        android:pathData="M10.6,15.4 m-1.7,0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0" />
 </vector>

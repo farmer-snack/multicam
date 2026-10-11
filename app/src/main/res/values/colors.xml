@@ -5,6 +5,10 @@
     <color name="bg_panel_light">#26FFFFFF</color>
     <color name="stroke_soft">#33FFFFFF</color>
     <color name="accent">#FF9F0A</color>
+    <!-- 橙底上的文字色：#FF9F0A 相对亮度 0.4607，配白字对比度仅 2.06:1
+         （WCAG AA 要求 4.5:1，户外基本读不出来）。
+         深墨 #FF1A1200 配橙底对比度 7.4:1。 -->
+    <color name="text_on_accent">#FF1A1200</color>
     <color name="accent_dim">#66FF9F0A</color>
     <color name="accent_soft">#1AFF9F0A</color>
     <color name="text_primary">#FFFFFFFF</color>

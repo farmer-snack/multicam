@@ -94,7 +94,7 @@ object TemporalDenoiser {
             w3.release(); avg.release()
 
             return DenoiseResult(merged8, validMask, true)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             AppLogger.e(TAG, "时序降噪失败: ${e.message}", e); return null
         } finally {
             if (!transferred) mats.forEach { runCatching { it.release() } }
@@ -106,8 +106,15 @@ object TemporalDenoiser {
         if (m <= maxDim) return src
         val scale = maxDim.toDouble() / m
         val out = Mat()
-        Imgproc.resize(src, out,
-            org.opencv.core.Size(src.cols() * scale, src.rows() * scale))
+        // 【关键修复】缩小必须用 INTER_AREA（盒式平均），默认的 INTER_LINEAR
+        // 只取 4 个相邻像素做双线性，对 4032→2048 这种整数倍缩小来说是**欠采样**：
+        // 树叶/砖墙/发丝产生混叠（摩尔纹），传感器噪声也被同样地点采样进来。
+        // 后果是降噪的输入本身已带采样误差，降噪效果被锁死、边缘出白边锯齿。
+        Imgproc.resize(
+            src, out,
+            org.opencv.core.Size(src.cols() * scale, src.rows() * scale),
+            0.0, 0.0, Imgproc.INTER_AREA
+        )
         return out
     }
 }

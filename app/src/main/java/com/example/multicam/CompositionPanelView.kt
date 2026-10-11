@@ -35,23 +35,32 @@ class CompositionPanelView(context: Context, attrs: AttributeSet? = null) : View
 
     private var data = Data()
 
+    /**
+     * 【修复】绘制尺寸单位换算。
+     * textSize / strokeWidth 的单位是 **px**，原来全是硬编码像素值：
+     * 在 3x 屏上 26px ≈ 8.7sp，"目标/水平/距离"这些数值小到读不出来；
+     * 在 1x 屏上又显得巨大。改为按密度换算，各屏幕观感一致。
+     */
+    private val density: Float get() = resources.displayMetrics.density
+    private fun dpF(v: Float): Float = v * density
+
     private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
-        textSize = 26f
+        textSize = dpF(26f)
         isFakeBoldText = true
     }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#B3FFFFFF")
-        textSize = 21f
+        textSize = dpF(21f)
     }
     private val valuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
-        textSize = 23f
+        textSize = dpF(23f)
         isFakeBoldText = true
     }
     private val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#FF9F0A")
-        textSize = 22f
+        textSize = dpF(22f)
     }
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#33FFFFFF")
@@ -62,21 +71,21 @@ class CompositionPanelView(context: Context, attrs: AttributeSet? = null) : View
     }
     private val dividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#26FFFFFF")
-        strokeWidth = 1f
+        strokeWidth = dpF(1f)
     }
     private val subjectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 2f
+        strokeWidth = dpF(2f)
         color = Color.parseColor("#FF9F0A")
     }
     private val lockPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#FF9F0A")
-        textSize = 21f
+        textSize = dpF(21f)
         isFakeBoldText = true
     }
     private val okPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#4CAF50")
-        textSize = 22f
+        textSize = dpF(22f)
         isFakeBoldText = true
     }
 
@@ -212,8 +221,33 @@ class CompositionPanelView(context: Context, attrs: AttributeSet? = null) : View
         }
     }
 
+    /**
+     * 【关键修复】原来无条件 `setMeasuredDimension(w, 330)` —— 330 是**像素**，
+     * 而 activity_main.xml 里写的是 `330dp`。在 xxhdpi(x3) 屏上，
+     * 面板被强行压成 110dp 高，而 onDraw 内部所有 y 偏移是按 ~300px 累加的
+     * → 底部"主体示意"与 hint 提示行被裁掉，文字也小到几乎读不出。
+     * 而且完全忽略 heightMeasureSpec 的 mode：父容器给 UNSPECIFIED 时
+     * getSize 返回 0 → 宽度变 0，面板彻底不可见。
+     *
+     * 现在：尊重 MeasureSpec，只在 EXACTLY/AT_MOST 下按 dp 给默认值。
+     */
+    private val dpUnit: Float
+        get() = resources.displayMetrics.density
+
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val w = MeasureSpec.getSize(widthMeasureSpec)
-        setMeasuredDimension(w, 330)
+        val desiredH = (330 * dpUnit).toInt()
+        val wMode = MeasureSpec.getMode(widthMeasureSpec)
+        val w = when (wMode) {
+            MeasureSpec.EXACTLY -> MeasureSpec.getSize(widthMeasureSpec)
+            MeasureSpec.AT_MOST -> MeasureSpec.getSize(widthMeasureSpec)
+            else -> (230 * dpUnit).toInt()   // UNSPECIFIED：用 XML 里的 230dp
+        }
+        val hMode = MeasureSpec.getMode(heightMeasureSpec)
+        val h = when (hMode) {
+            MeasureSpec.EXACTLY -> MeasureSpec.getSize(heightMeasureSpec)
+            MeasureSpec.AT_MOST -> minOf(desiredH, MeasureSpec.getSize(heightMeasureSpec))
+            else -> desiredH
+        }
+        setMeasuredDimension(w, h)
     }
 }

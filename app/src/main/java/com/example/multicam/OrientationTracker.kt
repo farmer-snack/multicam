@@ -23,10 +23,28 @@ class OrientationTracker(context: Context) : SensorEventListener {
 
     /** 累积 yaw（相对 start 时刻），单位：度 */
     @Volatile private var yaw = 0f
-    private var lastRawYaw = 0f
-    private var firstReading = true
+    // 【修复】这两个原来非 volatile 却与主线程 reset() 并发读写，
+    // 交错后 delta 会用到半新半旧的 lastRawYaw，多累加出假的角度增量。
+    @Volatile private var lastRawYaw = 0f
+    @Volatile private var firstReading = true
+
+    /**
+     * 设备自身的 roll 倾角（度）。
+     *
+     * 【新增】SensorManager.getOrientation 返回的 orientation[2] 就是 roll，
+     * 这里原本算出来了却只暴露 yaw，导致 SceneAdvisor 只能拿"画面内容里的
+     * 水平线倾角"冒充设备倾角去提示用户转手机（场景线歪 ≠ 设备歪）。
+     * 现在把真实的设备 roll 暴露出去。
+     */
+    @Volatile private var roll = 0f
 
     var onYawChanged: ((Float) -> Unit)? = null
+
+    /** 设备 roll（左右倾斜）变化回调，参数单位：度 */
+    var onRollChanged: ((Float) -> Unit)? = null
+
+    /** 设备当前左右倾斜角（度，正=右侧低），用于水平校正提示 */
+    fun getRoll(): Float = roll
 
     fun start() {
         rotationSensor?.let {
@@ -55,6 +73,12 @@ class OrientationTracker(context: Context) : SensorEventListener {
         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
         SensorManager.getOrientation(rotationMatrix, orientation)
         val rawYaw = Math.toDegrees(orientation[0].toDouble()).toFloat()
+        // orientation[2] 是 roll（左右倾斜），归一化到 -180..180
+        var rawRoll = Math.toDegrees(orientation[2].toDouble()).toFloat()
+        if (rawRoll > 180f) rawRoll -= 360f
+        if (rawRoll < -180f) rawRoll += 360f
+        roll = rawRoll
+        onRollChanged?.invoke(rawRoll)
 
         if (firstReading) {
             lastRawYaw = rawYaw

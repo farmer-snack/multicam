@@ -8,6 +8,7 @@ import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import kotlin.math.roundToInt
 
 /**
  * 软件人像虚化（无深度图方案）。
@@ -88,9 +89,15 @@ object PortraitBokehProcessor {
                 for (r in faceRects) {
                     val cx = r.centerX().toDouble()
                     val cy = r.centerY().toDouble()
-                    // 外扩：人像虚化要保住头肩，不只是脸部
-                    val ax = (r.width() * 1.25).toDouble().coerceAtLeast(4.0)
-                    val ay = (r.height() * 1.8).toDouble().coerceAtLeast(4.0)
+                    // 【关键修复】Imgproc.ellipse 的 axes 是**半轴长**。
+                    // 原来写 (r.width()*1.25, r.height()*1.8) 当成"总宽/总高"，
+                    // 实际覆盖范围是 2ax × 2ay = 2.5 倍脸宽 × 3.6 倍脸高 ≈ 9 倍人脸面积。
+                    // 4032×3024、人脸框 600×720 时椭圆达 1500×2592 px（占画面 32%），
+                    // 且垂直方向几乎贯通全高 → 表现为"竖向渐晕"而不是散景，
+                    // 背景几乎没被虚化。
+                    // 正确写法：半轴 = 目标总尺寸的一半。
+                    val ax = (r.width() * 1.25 / 2.0).toDouble().coerceAtLeast(4.0)
+                    val ay = (r.height() * 1.8 / 2.0).toDouble().coerceAtLeast(4.0)
                     Imgproc.ellipse(
                         mask, Point(cx, cy), Size(ax, ay),
                         0.0, 0.0, 360.0, Scalar(255.0), -1
@@ -100,8 +107,10 @@ object PortraitBokehProcessor {
                 // 无脸：中心椭圆 + 底部留白（经典人像构图）
                 val cx = w / 2.0
                 val cy = h * 0.48
-                val ax = w * 0.34
-                val ay = h * 0.46
+                // 【修复】同样按半轴给值。原来 w*0.34 / h*0.46 会被放大一倍，
+                // 覆盖 68%宽 × 92%高 → 只有四边窄窄一圈被虚化，形不成人像效果。
+                val ax = w * 0.17
+                val ay = h * 0.23
                 Imgproc.ellipse(
                     mask, Point(cx, cy), Size(ax, ay),
                     0.0, 0.0, 360.0, Scalar(255.0), -1
@@ -114,10 +123,20 @@ object PortraitBokehProcessor {
 
             // ---------- 3. 全图模糊 ----------
             onProgress?.invoke(55, "人像：背景模糊")
-            val k = (blurStrength.coerceIn(3, 60) or 1)
-            // OpenCV Java 绑定没有 stackBlur，用高斯模糊
+            // 【关键修复】模糊半径必须按分辨率归一化。
+            // 原来调用方传的是固定像素核（7~45），而 GaussianBlur 的
+            // sigma = 0.3*((k-1)*0.5-1)+0.8 → k=45 时 sigma≈7.1px。
+            // 在 4032px 宽的图上 sigma 7 约等于画幅的 1/570，视觉上"等于没虚化"；
+            // 同时羽化半径却是按 min(w,h)*0.06≈242px 归一化的 ——
+            // 于是形成"过渡很宽但一点都不糊"的反直觉观感。
+            // 现在 blurStrength 是 0..100 的强度百分比，按短边换算成实际核大小。
+            val k = ((blurStrength.coerceIn(1, 100) / 100.0) * minOf(w, h) * 0.08)
+                .roundToInt().coerceIn(3, 201) or 1
             val blurredLocal = Mat()
-            Imgproc.GaussianBlur(src, blurredLocal, Size(k.toDouble(), k.toDouble()), 0.0)
+            Imgproc.GaussianBlur(
+                src, blurredLocal, Size(k.toDouble(), k.toDouble()), 0.0,
+                0.0, Core.BORDER_REPLICATE
+            )
             blurredRef = blurredLocal
 
             // ---------- 4. 按 mask 混合 ----------
@@ -166,7 +185,7 @@ object PortraitBokehProcessor {
             } finally {
                 ob.recycle()
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             AppLogger.e(TAG, "人像虚化异常: ${e.message}", e)
             return jpeg
         } finally {

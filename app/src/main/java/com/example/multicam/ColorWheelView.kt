@@ -28,6 +28,14 @@ class ColorWheelView(context: Context, attrs: AttributeSet? = null) : View(conte
     /** 外圈色相环变化：angle 0..360 */
     var onHueRingChanged: ((angle: Float) -> Unit)? = null
 
+    /**
+     * 【新增】拖动结束（手指抬起）。
+     * 调色参数持久化必须等松手再做：原来每次 ACTION_MOVE 都调
+     * persistCustomGrade()（内部 2 次 SharedPreferences.edit().apply()），
+     * 60~120Hz 拖动 = 每秒 120~240 次持锁写，把 UI 卡顿放大数倍。
+     */
+    var onDragFinished: (() -> Unit)? = null
+
     private var centerX = 0f
     private var centerY = 0f
     private var outerR = 0f      // 色相环外半径
@@ -41,30 +49,39 @@ class ColorWheelView(context: Context, attrs: AttributeSet? = null) : View(conte
     private var ringAngle = 0f
 
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    // 【修复】Paint 的 strokeWidth / setShadowLayer 单位都是 px。
+    // 原来全部硬编码像素值，在 3x 屏上环线与光标细到几乎看不见。
+    // 这里统一按屏幕密度换算（几何尺寸 outerR/ringWidth 由 onSizeChanged
+    // 按实际 view 尺寸算，本身已经是正确的 px）。
+    private val density: Float get() = resources.displayMetrics.density
+    private fun dpF(v: Float): Float = v * density
+
     private val ringBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 1.5f
+        strokeWidth = 1.5f * resources.displayMetrics.density
         color = Color.parseColor("#33FFFFFF")
     }
     private val innerBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val crossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#4DFFFFFF")
-        strokeWidth = 1f
+        strokeWidth = 1f * resources.displayMetrics.density
         style = Paint.Style.STROKE
     }
     private val pointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         style = Paint.Style.FILL
-        setShadowLayer(8f, 0f, 0f, Color.BLACK)
+        setShadowLayer(
+            8f * resources.displayMetrics.density, 0f, 0f, Color.BLACK
+        )
     }
     private val pointHaloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 2f
+        strokeWidth = 2f * resources.displayMetrics.density
         color = Color.parseColor("#CCFFFFFF")
     }
     private val ringCursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 3f * resources.displayMetrics.density
         strokeCap = Paint.Cap.ROUND
         color = Color.WHITE
     }
@@ -80,9 +97,13 @@ class ColorWheelView(context: Context, attrs: AttributeSet? = null) : View(conte
         super.onSizeChanged(w, h, oldw, oldh)
         centerX = w / 2f
         centerY = h / 2f
-        outerR = minOf(w, h) / 2f - 6f
-        ringWidth = (outerR * 0.20f).coerceAtLeast(18f)
-        innerR = outerR - ringWidth - 6f
+        // 【修复】内边距与环宽下限原本是固定像素（6px / 18px），
+        // 在 3x 屏上占比过小、环带挤在一起；在 1x 屏上又过宽。
+        // 改为 dp 语义。
+        val pad = dpF(6f)
+        outerR = minOf(w, h) / 2f - pad
+        ringWidth = (outerR * 0.20f).coerceAtLeast(dpF(18f))
+        innerR = (outerR - ringWidth - pad).coerceAtLeast(dpF(8f))
         buildShaders()
     }
 
@@ -161,22 +182,48 @@ class ColorWheelView(context: Context, attrs: AttributeSet? = null) : View(conte
         val dy = event.y - centerY
         val dist = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
 
-        when (event.action) {
+        // 【关键修复】三个问题一起改：
+        //  1. 用 event.action 而非 actionMasked —— ACTION_POINTER_DOWN/UP
+        //     的 action 含 pointerIndex<<8 高位，不匹配任何分支 → 落到
+        //     super.onTouchEvent() 返回 false，父容器会抢走手势，
+        //     且第一根手指抬起时 dragMode 不复位，后续 MOVE 用第二根手指的
+        //     坐标 → 色相跳变。
+        //  2. dist 判定是 `dist >= innerR-4` 与 `dist <= innerR-4` 在同一阈值
+        //     上互补，else -> 0 **永远不可达**；而且没有上界，
+        //     View 是 220dp 正方形、outerR≈104dp，角点到圆心约 155dp
+        //     > outerR 的那圈"盘外空白"也全部命中"拖色相环"
+        //     → 点四角色相瞬间跳到 45°/135°。
+        //  3. 现在明确区分 环带 / 内圈 / 盘外，盘外不吃事件（交还父容器）。
+        when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                val ringOuter = outerR + TOUCH_SLOP
                 dragMode = when {
-                    dist >= innerR - 4f -> 2   // 环上
-                    dist <= innerR - 4f -> 1   // 内圈
-                    else -> 0
+                    innerR <= 0f || outerR <= 0f -> 0
+                    dist >= innerR && dist <= ringOuter -> 2   // 环带
+                    dist < innerR -> 1                           // 内圈
+                    else -> 0                                     // 盘外空白
                 }
-                handleDrag(event.x, event.y, dist, dx, dy)
+                if (dragMode == 0) return false
+                handleDrag(dx, dy)
                 parent?.requestDisallowInterceptTouchEvent(true)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (dragMode != 0) handleDrag(event.x, event.y, dist, dx, dy)
+                if (dragMode == 0) return false
+                // 只跟随第一根手指，多指时不会被第二根手指"抢方向盘"
+                handleDrag(
+                    event.getX(0) - centerX,
+                    event.getY(0) - centerY
+                )
                 return true
             }
+            // 多指按下/抬起：吞掉但不改变 dragMode，手指交接时不会跳变
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> return true
+
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                // 【修复】只在真正拖动过（dragMode != 0）时通知结束，
+                // 避免"点一下盘外空白"也触发一次 SharedPreferences 写
+                if (dragMode != 0) onDragFinished?.invoke()
                 dragMode = 0
                 parent?.requestDisallowInterceptTouchEvent(false)
                 return true
@@ -185,20 +232,33 @@ class ColorWheelView(context: Context, attrs: AttributeSet? = null) : View(conte
         return super.onTouchEvent(event)
     }
 
-    private fun handleDrag(x: Float, y: Float, dist: Float, dx: Float, dy: Float) {
+    /** 触摸判定容差（像素） */
+    private val TOUCH_SLOP: Float
+        get() = android.view.ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+
+    /**
+     * 拖动处理。
+     *
+     * @param dx 相对圆心的 x 偏移（外圈分支算色相角、内圈分支算归一化坐标）
+     * @param dy 相对圆心的 y 偏移
+     * 注：x/y/dist 是绝对坐标，逻辑上用不到（相对量已由 dx/dy 给出），
+     * 这里不再接收，避免调用方误传。
+     */
+    private fun handleDrag(dx: Float, dy: Float) {
         if (dragMode == 2) {
             var ang = Math.toDegrees(Math.atan2(dy.toDouble(), dx.toDouble())).toFloat()
             if (ang < 0f) ang += 360f
             ringAngle = ang
             onHueRingChanged?.invoke(ang)
         } else {
+            if (innerR <= 0f) return
             val nx = (dx / innerR).coerceIn(-1f, 1f)
             val ny = (dy / innerR).coerceIn(-1f, 1f)
             // 限制在圆内
             val len = Math.hypot(nx.toDouble(), ny.toDouble()).toFloat()
             if (len > 1f) {
-                innerX = nx / len * 1f
-                innerY = ny / len * 1f
+                innerX = nx / len
+                innerY = ny / len
             } else {
                 innerX = nx
                 innerY = ny

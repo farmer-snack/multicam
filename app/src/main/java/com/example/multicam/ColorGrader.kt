@@ -60,20 +60,46 @@ object ColorGrader {
         // 且与对比度的 0.5（归一化尺度）混用导致影调几乎失效。改为 0..255 尺度基准。
         val toneOffset = tone * 64.0
 
-        // 三个矩阵相乘：hueM * tempM * satM
-        val m1 = multiply3x3(hueM, tempM)
-        val m2 = multiply3x3(m1, satM)
+        /**
+         * 【关键修复】统一算子顺序，并让 [LutBuilder] 与本实现完全一致。
+         *
+         * 矩阵连乘是**右到左**作用：m2 = hueM · tempM · satM
+         * 意味着实际顺序是 **sat → temp → hue**（饱和度最先、最后才是色调）。
+         * 而原来的 LutBuilder.transform 走的是 temp → hue → tone → sat → contrast，
+         * 两者完全不同 —— 饱和度与色温/色调**不可交换**，
+         * 于是实时预览（GL LUT）与最终成片（这里）必然不一致，
+         * 表现为"预览里看到的颜色和拍出来的不是一回事"。
+         *
+         * 现在两处统一为：**sat → temp → hue → (contrast + tone)**。
+         * LutBuilder 已同步改成同样的顺序（见其 buildInto 的注释）。
+         */
+        val m1 = multiply3x3(tempM, satM)   // sat 先作用
+        val m2 = multiply3x3(hueM, m1)      // 再 temp，最后 hue
 
         // 应用对比度：out = (in - 0.5) * ctr + 0.5   —— 归一化尺度，需 ×255 换到像素尺度
         for (i in m2.indices) m2[i] *= ctr
         val b = (0.5 * (1 - ctr) * 255.0 + toneOffset).toFloat()
 
-        // 3x4 矩阵：前 3 列做色彩线性变换，第 4 列为逐通道偏移
+        // 3x4 矩阵：行主序布局，下标 3 / 7 / 11 是「逐通道偏移」槽。
+        //
+        // 【关键修复】原来是：
+        //     m2.copyInto(data)          // m2[0..8] → data[0..8]
+        //     data[9] = b; data[10] = b; data[11] = b
+        // 偏移列被写到了 9 / 10 / 11，而正确位置是 **3 / 7 / 11**。
+        // 后果是双重破坏：
+        //   1. data[9]/data[10] 正好落在 m[2][1] / m[2][2] —— 红输出通道的
+        //      绿/蓝线性系数被 b 覆盖掉（b=0 时两个系数直接变成 0）；
+        //   2. m2[7] 落到了偏移槽 m[1][3]，m2[8] 落到了 m[2][0]。
+        // 代入单位矩阵验算：out_R = m2[8]·B + b·G + b·R + b = 1·B + 0 + 0 + 0 = B
+        // → **红通道整个变成蓝通道**，肤色发青、天空发绿，是全局性严重偏色。
+        //
+        // 正确写法：显式按下标摆放，不依赖 copyInto 的连续假设。
         val out = Mat()
         val transform = Mat(3, 4, CvType.CV_32F)
         val data = FloatArray(12)
-        m2.copyInto(data)
-        data[9] = b; data[10] = b; data[11] = b
+        data[0] = m2[0]; data[1] = m2[1]; data[2] = m2[2]; data[3] = b
+        data[4] = m2[3]; data[5] = m2[4]; data[6] = m2[5]; data[7] = b
+        data[8] = m2[6]; data[9] = m2[7]; data[10] = m2[8]; data[11] = b
         transform.put(0, 0, data)
         Core.transform(input, out, transform)
         transform.release()
